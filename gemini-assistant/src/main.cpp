@@ -28,6 +28,7 @@
 #include <driver/i2s.h>
 #include <freertos/stream_buffer.h>
 #include <mbedtls/base64.h>
+#include <time.h>
 
 #include "certs.h"
 
@@ -61,7 +62,9 @@ static const char *SYSTEM_PROMPT =
     "من غير رموز أو قوائم أو تنسيق. لو المستخدم كلمك بلغة تانية رد بنفس لغته. "
     "لو السؤال محتاج معلومة حديثة استخدم البحث. "
     "لو طلب راديو أو محطة استخدم play_radio، وقول جملة قصيرة جدًا قبل التشغيل. "
-    "وقف الراديو بـ stop_radio، وغيّر الصوت بـ set_volume.";
+    "وقف الراديو بـ stop_radio، وغيّر الصوت بـ set_volume. "
+    "لو طلب منبه أو تذكير استخدم set_reminder، واكتب نص التذكير بنفس كلام المستخدم من غير تغيير. "
+    "لو سأل الساعة كام أو التاريخ استخدم get_time.";
 
 // ---------------------------------------------------------------- settings
 struct Settings {
@@ -581,7 +584,7 @@ String jsonRaw(const String &obj, const char *key) {
   while (i < n && (obj[i] == ' ' || obj[i] == ':' || obj[i] == '\n')) i++;
   if (i < n && obj[i] == '"') return jsonField(obj, key);
   int start = i;
-  while (i < n && (isdigit(obj[i]) || obj[i] == '.' || obj[i] == '-')) i++;
+  while (i < n && (isalnum(obj[i]) || obj[i] == '.' || obj[i] == '-')) i++;
   return obj.substring(start, i);
 }
 
@@ -644,6 +647,76 @@ bool findStation(const String &query, const String &country, String &url) {
   return false;
 }
 
+// ---------------------------------------------------------------- reminders
+// Alarms live in flash so they survive a power cut. Time comes from NTP
+// (Egypt time, with summer time).
+static const char *EGYPT_TZ = "EET-2EEST,M4.5.5/0,M10.5.4/24";
+
+struct Reminder {
+  uint32_t at;     // unix time of the next ring
+  uint8_t used;
+  uint8_t daily;
+  uint16_t hhmm;   // for daily repeats
+  char text[160];
+};
+static const int MAX_REMINDERS = 12;
+Reminder reminders[MAX_REMINDERS];
+String pendingReminder;  // text waiting to be spoken
+
+void loadReminders() {
+  memset(reminders, 0, sizeof(reminders));
+  prefs.begin("gemini", true);
+  if (prefs.getBytesLength("rem") == sizeof(reminders)) prefs.getBytes("rem", reminders, sizeof(reminders));
+  prefs.end();
+}
+
+void saveReminders() {
+  prefs.begin("gemini", false);
+  prefs.putBytes("rem", reminders, sizeof(reminders));
+  prefs.end();
+}
+
+bool clockOk() { return time(nullptr) > 1700000000; }
+
+// Next time the clock shows hh:mm, `days` days from today (0 = next one).
+time_t nextAt(int hh, int mm, int days) {
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+  t.tm_hour = hh;
+  t.tm_min = mm;
+  t.tm_sec = 0;
+  t.tm_mday += days;
+  t.tm_isdst = -1;
+  time_t ts = mktime(&t);
+  if (days == 0 && ts <= now) {
+    t.tm_mday += 1;
+    t.tm_isdst = -1;
+    ts = mktime(&t);
+  }
+  return ts;
+}
+
+String fmtTime(time_t ts) {
+  struct tm t;
+  localtime_r(&ts, &t);
+  char buf[40];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M (%A)", &t);
+  return buf;
+}
+
+String listReminders() {
+  String out;
+  int n = 0;
+  for (int i = 0; i < MAX_REMINDERS; i++) {
+    if (!reminders[i].used) continue;
+    n++;
+    out += String(i + 1) + ") " + fmtTime(reminders[i].at) + (reminders[i].daily ? " daily" : "") + ": " +
+           reminders[i].text + ". ";
+  }
+  return n ? out : "no reminders";
+}
+
 // ---------------------------------------------------------------- Gemini
 extern bool recording;
 extern bool gateOpen;
@@ -691,6 +764,21 @@ void sendSetup() {
          "\"country_code\":{\"type\":\"STRING\",\"description\":\"Optional two letter country code, e.g. EG\"}},"
          "\"required\":[\"station\"]}},"
          "{\"name\":\"stop_radio\",\"description\":\"Stop the radio.\"},"
+         "{\"name\":\"get_time\",\"description\":\"Current local date and time in Egypt.\"},"
+         "{\"name\":\"set_reminder\",\"description\":\"Set an alarm/reminder. At that time the device plays a "
+         "notification sound and you will be asked to say the message. Give either time (HH:MM, 24h, Egypt time, "
+         "optionally with days_from_today) or in_minutes.\","
+         "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+         "\"message\":{\"type\":\"STRING\",\"description\":\"What to remind about, in the user's exact words\"},"
+         "\"time\":{\"type\":\"STRING\",\"description\":\"HH:MM 24-hour\"},"
+         "\"days_from_today\":{\"type\":\"INTEGER\",\"description\":\"0 today or next, 1 tomorrow...\"},"
+         "\"in_minutes\":{\"type\":\"INTEGER\"},"
+         "\"daily\":{\"type\":\"BOOLEAN\",\"description\":\"Repeat every day\"}},"
+         "\"required\":[\"message\"]}},"
+         "{\"name\":\"list_reminders\",\"description\":\"List the alarms/reminders with their numbers.\"},"
+         "{\"name\":\"cancel_reminder\",\"description\":\"Cancel a reminder by its number from list_reminders, or 0 for all.\","
+         "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"number\":{\"type\":\"INTEGER\"}},"
+         "\"required\":[\"number\"]}},"
          "{\"name\":\"set_volume\",\"description\":\"Set the speaker volume.\","
          "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
          "\"level\":{\"type\":\"INTEGER\",\"description\":\"1 to 100\"}},\"required\":[\"level\"]}}";
@@ -849,6 +937,64 @@ void handleToolCall(const char *msg) {
         q = "action=debtors";
       }
       sendToolResponse(id, name, callSheet(q));
+    } else if (name == "get_time") {
+      sendToolResponse(id, name, clockOk() ? "now " + fmtTime(time(nullptr)) : "clock not synced yet");
+    } else if (name == "set_reminder") {
+      String text = jsonField(call, "message");
+      String hhmm = jsonField(call, "time");
+      int inMin = jsonRaw(call, "in_minutes").toInt();
+      int days = jsonRaw(call, "days_from_today").toInt();
+      bool daily = jsonRaw(call, "daily") == "true";
+      int slot = -1;
+      for (int i = 0; i < MAX_REMINDERS; i++) {
+        if (!reminders[i].used) {
+          slot = i;
+          break;
+        }
+      }
+      int hh = -1, mm = -1;
+      if (hhmm.length()) sscanf(hhmm.c_str(), "%d:%d", &hh, &mm);
+      if (!clockOk()) {
+        sendToolResponse(id, name, "clock not synced yet, try again in a minute");
+      } else if (slot < 0) {
+        sendToolResponse(id, name, "reminder list is full (12), cancel one first");
+      } else if (inMin <= 0 && (hh < 0 || hh > 23 || mm < 0 || mm > 59)) {
+        sendToolResponse(id, name, "need time HH:MM or in_minutes");
+      } else {
+        Reminder &r = reminders[slot];
+        memset(&r, 0, sizeof(r));
+        r.used = 1;
+        if (inMin > 0) {
+          r.at = time(nullptr) + inMin * 60;
+          struct tm t;
+          time_t at = r.at;
+          localtime_r(&at, &t);
+          r.hhmm = t.tm_hour * 100 + t.tm_min;
+        } else {
+          r.at = nextAt(hh, mm, max(days, 0));
+          r.hhmm = hh * 100 + mm;
+        }
+        r.daily = daily ? 1 : 0;
+        strlcpy(r.text, text.c_str(), sizeof(r.text));
+        saveReminders();
+        sendToolResponse(id, name, "reminder " + String(slot + 1) + " set for " + fmtTime(r.at) +
+                                       (daily ? " every day" : "") + ", now is " + fmtTime(time(nullptr)));
+      }
+    } else if (name == "list_reminders") {
+      sendToolResponse(id, name, listReminders());
+    } else if (name == "cancel_reminder") {
+      int n = jsonRaw(call, "number").toInt();
+      if (n == 0) {
+        memset(reminders, 0, sizeof(reminders));
+        saveReminders();
+        sendToolResponse(id, name, "all reminders cancelled");
+      } else if (n >= 1 && n <= MAX_REMINDERS && reminders[n - 1].used) {
+        reminders[n - 1].used = 0;
+        saveReminders();
+        sendToolResponse(id, name, "reminder " + String(n) + " cancelled");
+      } else {
+        sendToolResponse(id, name, "no reminder with that number");
+      }
     } else if (name == "set_volume") {
       settings.volume = constrain(jsonInt(call, "level", settings.volume), 1, 100);
       saveSettings();
@@ -1118,6 +1264,73 @@ void stopTalking() {
   setState(State::Thinking);
 }
 
+// ---------------------------------------------------------------- reminder ringing
+// A short two-note "message arrived" chime, played twice.
+void queueChime() {
+  static const int RATE = SPK_RATE;
+  const int noteMs = 110, gapMs = 50;
+  const float notes[] = {1046.5f, 1568.0f, 0, 1046.5f, 1568.0f};
+  size_t total = 0;
+  for (float f : notes) total += (f > 0 ? noteMs : 250) + gapMs;
+  size_t samples = total * RATE / 1000;
+  int16_t *pcm = (int16_t *)ps_malloc(samples * 2);
+  if (!pcm) return;
+  size_t pos = 0;
+  for (float f : notes) {
+    int len = (f > 0 ? noteMs : 250) * RATE / 1000;
+    for (int i = 0; i < len; i++) {
+      float env = f > 0 ? expf(-4.0f * i / len) : 0;
+      pcm[pos++] = (int16_t)(env * 14000.0f * sinf(2.0f * PI * f * i / RATE));
+    }
+    int gap = gapMs * RATE / 1000;
+    for (int i = 0; i < gap; i++) pcm[pos++] = 0;
+  }
+  queuePlayback((const uint8_t *)pcm, pos * 2);
+  free(pcm);
+}
+
+void sendClientText(const String &text) {
+  String msg = "{\"clientContent\":{\"turns\":[{\"role\":\"user\",\"parts\":[{\"text\":\"" + sanitize(text) +
+               "\"}]}],\"turnComplete\":true}}";
+  ws.sendTXT(msg);
+}
+
+void checkReminders() {
+  static uint32_t lastCheck = 0;
+  if (millis() - lastCheck < 1000 || !clockOk()) return;
+  lastCheck = millis();
+  if (pendingReminder.isEmpty()) {
+    time_t now = time(nullptr);
+    for (int i = 0; i < MAX_REMINDERS; i++) {
+      Reminder &r = reminders[i];
+      if (!r.used || r.at > now) continue;
+      pendingReminder = r.text;
+      if (now - r.at > 120) pendingReminder += " (this reminder was missed while the device was off)";
+      if (r.daily) {
+        r.at = nextAt(r.hhmm / 100, r.hhmm % 100, 0);
+      } else {
+        r.used = 0;
+      }
+      saveReminders();
+      break;
+    }
+  }
+  if (pendingReminder.length() && sessionReady && !recording && !gateOpen) {
+    stopRadio();
+    flushPlayback = true;
+    uint32_t t0 = millis();
+    while (flushPlayback && millis() - t0 < 500) delay(5);
+    queueChime();
+    turnDone = false;
+    setState(State::Speaking, "Reminder");
+    sendClientText(
+        "[Reminder from the device alarm] Say to the user, in Egyptian Arabic, the word تذكير then exactly this "
+        "reminder in the same words, nothing else: " +
+        pendingReminder);
+    pendingReminder = "";
+  }
+}
+
 // ---------------------------------------------------------------- setup portal
 bool talkPressed() {
   return digitalRead(PIN_TALK) == LOW || digitalRead(PIN_BOOT) == LOW;
@@ -1183,6 +1396,7 @@ void setup() {
   pinMode(PIN_BOOT, INPUT_PULLUP);
 
   loadSettings();
+  loadReminders();
 
   Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
   oled.setBusClock(400000);
@@ -1224,6 +1438,7 @@ void setup() {
     runSetupPortal(true);
   }
   WiFi.setSleep(false);  // lower latency for streaming audio
+  configTzTime(EGYPT_TZ, "pool.ntp.org", "time.google.com");
 
   if (settings.apiKey.isEmpty()) {
     setState(State::Error, "No API key. Restart and press the button to set it.");
@@ -1271,6 +1486,8 @@ void loop() {
     radioStartReq = true;
     setState(State::Radio, radioName);
   }
+  checkReminders();
+
   if (radioFailed) {
     radioFailed = false;
     setState(State::Ready, "Radio stream failed");
