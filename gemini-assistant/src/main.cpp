@@ -286,11 +286,17 @@ class SpeakerOut : public AudioOutput {
     return true;
   }
   bool ConsumeSample(int16_t sample[2]) override {
+    // Returning false hands control back to the radio task every 256 samples,
+    // so it can react to stop requests (the decoder retries this sample).
+    if (fill == 256) {
+      flush();
+      return false;
+    }
     MakeSampleStereo16(sample);
     int gain = settings.volume * 256 / 100;
     frames[fill * 2] = (int16_t)(((int32_t)sample[0] * gain) >> 8);
     frames[fill * 2 + 1] = (int16_t)(((int32_t)sample[1] * gain) >> 8);
-    if (++fill == 256) flush();
+    fill++;
     return true;
   }
   void flush() override {
@@ -421,7 +427,7 @@ static const Favorite FAVORITES[] = {
     {"Monte Carlo Doualiya", "monte carlo|montecarlo|doualiya|mcd",
      "https://montecarlodoualiya128k.ice.infomaniak.ch/mc-doualiya.mp3"},
     {"Middle East Radio", "middle east|sharq|el sharq|al sharq", "https://s2.voscast.com:7387/stream"},
-    {"Al Arabiya", "arabiya|arabia", "https://stream.radiojar.com/s1mygd1frxquv"},
+    {"Al Arabiya", "arabiya", "https://stream.radiojar.com/s1mygd1frxquv"},
     {"Quran Cairo", "quran|koran", "https://stream.radiojar.com/8s5u5tpdtwzuv"},
     {"Nogoum FM", "nogoum|nogum|nujoom", "https://stream.zeno.fm/qb1zvsykm98uv"},
     {"Radio 9090", "9090", "https://9090streaming.mobtada.com/9090FMEGYPT"},
@@ -1131,7 +1137,7 @@ void loop() {
   if (pressed != lastPressed && millis() - lastChange > 30) {
     lastChange = millis();
     lastPressed = pressed;
-    if (pressed && (radioActive || radioPending)) {
+    if (pressed && (radioActive || radioPending) && (settings.handsFree || !sessionReady)) {
       stopRadio();
       setState(State::Ready);
     } else if (pressed && state == State::Error) {
