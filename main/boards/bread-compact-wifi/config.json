@@ -17,7 +17,9 @@
         {
             "name": "bread-compact-wifi-sh1106",
             "sdkconfig_append": [
-                "CONFIG_OLED_SH1106_128X64=y"
+                "CONFIG_OLED_SH1106_128X64=y",
+                "CONFIG_LV_USE_BIDI=y",
+                "CONFIG_LV_BIDI_DIR_AUTO=y"
             ]
         }
     ]
