@@ -8,16 +8,18 @@ jobs:
     steps:
       - name: Search radio-browser and test streams
         run: |
-          for q in "General Program" "Egyptian Radio" "ERTU" "Middle East" "Sharq Al Awsat" "الشرق الأوسط" "البرنامج العام" "BBC Arabic" "Al Arabiya" "العربية" "Radio Masr" "Nogoum" "Quran Cairo"; do
+          api=https://de1.api.radio-browser.info/json/stations
+          fmt='.[] | "\(.votes)|\(.codec)|\(.bitrate)|\(.countrycode)|\(.name)|\(.url_resolved)"'
+          echo "=== EG top"
+          curl -s -G -A probe "$api/search" -d countrycode=EG -d hidebroken=true -d order=votes -d reverse=true -d limit=80 | jq -r "$fmt" | tee -a list.txt
+          for q in "Monte Carlo" "MCD" "DW" "Deutsche Welle" "Al Arabiya" "Arabiya" "Sharq" "Middle East Radio" "Egypt" "Misr" "Cairo" "Quran"; do
             echo "=== $q"
-            curl -s -G -A probe "https://de1.api.radio-browser.info/json/stations/search" \
-              --data-urlencode "name=$q" -d hidebroken=true -d order=votes -d reverse=true -d limit=8 |
-              jq -r '.[] | "\(.votes)|\(.codec)|\(.bitrate)|\(.countrycode)|\(.name)|\(.url_resolved)|\(.url)"'
-          done > list.txt
-          cat list.txt
-          echo "##### TESTS"
-          grep -v '^===' list.txt | cut -d'|' -f6,7 | tr '|' '\n' | sort -u | while read u; do
-            h=$(curl -s -m 6 -A probe -D - -o /dev/null -r 0-2000 "$u" 2>/dev/null | grep -i -m1 '^content-type' | tr -d '\r')
-            code=$(curl -s -m 6 -A probe -o /dev/null -w '%{http_code} %{url_effective}' "$u" -r 0-100 2>/dev/null)
-            echo "$code | $h | $u"
+            curl -s -G -A probe "$api/search" --data-urlencode "name=$q" -d hidebroken=true -d order=votes -d reverse=true -d limit=10 | jq -r "$fmt" | tee -a list.txt
           done
+          echo "##### TESTS"
+          cut -d'|' -f6 list.txt | sort -u > urls.txt
+          while read -r u; do
+            r=$(curl -s -m 8 -A probe -L -o /dev/null -D hdr.txt -w '%{http_code} %{url_effective}' --max-filesize 1 "$u" < /dev/null)
+            ct=$(grep -i '^content-type' hdr.txt | tail -1 | tr -d '\r')
+            echo "T|$r|$ct|$u"
+          done < urls.txt
