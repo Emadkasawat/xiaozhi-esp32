@@ -686,14 +686,36 @@ int jsonInt(const String &obj, const char *key, int fallback) {
 
 void handleToolCall(const char *msg) {
   String body(strstr(msg, "\"toolCall\""));
-  int pos = 0;
+  // Walk the functionCalls array object by object (key order is not fixed:
+  // Gemini usually sends name, args, then id).
+  int pos = body.indexOf('[', body.indexOf("\"functionCalls\""));
+  if (pos < 0) return;
   for (;;) {
-    int s = body.indexOf("\"id\"", pos);
+    int s = body.indexOf('{', pos);
     if (s < 0) break;
-    int e = body.indexOf("\"id\"", s + 1);
-    if (e < 0) e = body.length();
-    String call = body.substring(s, e);
-    pos = e;
+    int depth = 0;
+    bool inStr = false;
+    int e = s;
+    for (; e < (int)body.length(); e++) {
+      char c = body[e];
+      if (inStr) {
+        if (c == '\\') e++;
+        else if (c == '"') inStr = false;
+      } else if (c == '"') {
+        inStr = true;
+      } else if (c == '{') {
+        depth++;
+      } else if (c == '}') {
+        if (--depth == 0) break;
+      } else if (c == ']' && depth == 0) {
+        break;
+      }
+    }
+    if (depth != 0) break;
+    String call = body.substring(s, e + 1);
+    pos = e + 1;
+    int next = pos;
+    while (next < (int)body.length() && (body[next] == ' ' || body[next] == '\n' || body[next] == '\r')) next++;
     String id = jsonField(call, "id");
     String name = jsonField(call, "name");
     Serial.printf("[tool] %s\n", name.c_str());
@@ -717,6 +739,7 @@ void handleToolCall(const char *msg) {
         sendToolResponse(id, name, "playing " + station);
       } else {
         sendToolResponse(id, name, "not_found");
+        setState(State::Thinking, "Not found: " + station);
       }
     } else if (name == "stop_radio") {
       stopRadio();
@@ -728,6 +751,7 @@ void handleToolCall(const char *msg) {
     } else if (name.length()) {
       sendToolResponse(id, name, "unknown function");
     }
+    if (next >= (int)body.length() || body[next] != ',') break;
   }
 }
 
