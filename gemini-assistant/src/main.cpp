@@ -14,6 +14,11 @@
 // "Gemini-Setup" Wi-Fi hotspot, and stored in flash (never in this repo).
 
 #include <Arduino.h>
+#include <AudioFileSourceBuffer.h>
+#include <AudioFileSourceICYStream.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioOutput.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <U8g2lib.h>
 #include <WebSocketsClient.h>
@@ -54,7 +59,9 @@ static const char *SYSTEM_PROMPT =
     "أنت مساعد صوتي ودود اسمه جيميناي، شغال جوه جهاز صغير. "
     "رد دايمًا بالعربي المصري، بجمل قصيرة وواضحة تتقال بصوت عالي، "
     "من غير رموز أو قوائم أو تنسيق. لو المستخدم كلمك بلغة تانية رد بنفس لغته. "
-    "لو السؤال محتاج معلومة حديثة استخدم البحث.";
+    "لو السؤال محتاج معلومة حديثة استخدم البحث. "
+    "لو طلب راديو أو محطة استخدم play_radio، وقول جملة قصيرة جدًا قبل التشغيل. "
+    "وقف الراديو بـ stop_radio، وغيّر الصوت بـ set_volume.";
 
 // ---------------------------------------------------------------- settings
 struct Settings {
@@ -95,7 +102,7 @@ void saveSettings() {
 // ---------------------------------------------------------------- display
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
-enum class State { Boot, Setup, Wifi, Connecting, Ready, Listening, Thinking, Speaking, Error };
+enum class State { Boot, Setup, Wifi, Connecting, Ready, Listening, Thinking, Speaking, Radio, Error };
 volatile State state = State::Boot;
 String detail;
 bool screenDirty = true;
@@ -110,6 +117,7 @@ const char *stateTitle(State s) {
     case State::Listening: return "Listening";
     case State::Thinking: return "Thinking";
     case State::Speaking: return "Speaking";
+    case State::Radio: return "Radio";
     case State::Error: return "Error";
   }
   return "";
@@ -156,6 +164,7 @@ void drawScreen() {
       case State::Listening: d = settings.handsFree ? "" : "Release when done"; break;
       case State::Thinking: d = "Waiting for Gemini"; break;
       case State::Speaking: d = "Press to interrupt"; break;
+      case State::Radio: d = "Press the button to stop"; break;
       default: break;
     }
   }
@@ -255,6 +264,204 @@ bool playbackIdle() {
   return !playbackActive && xStreamBufferIsEmpty(playBuf) == pdTRUE;
 }
 
+// ---------------------------------------------------------------- radio
+// Internet radio: Gemini calls play_radio(station); we look the station up in
+// the public radio-browser.info directory and stream its MP3 to the speaker.
+class SpeakerOut : public AudioOutput {
+ public:
+  SpeakerOut() {
+    hertz = SPK_RATE;
+    bps = 16;
+    channels = 2;
+  }
+  bool begin() override {
+    fill = 0;
+    return true;
+  }
+  bool SetRate(int hz) override {
+    if (hz != hertz) {
+      hertz = hz;
+      i2s_set_sample_rates(I2S_SPK, hz);
+    }
+    return true;
+  }
+  bool ConsumeSample(int16_t sample[2]) override {
+    MakeSampleStereo16(sample);
+    int gain = settings.volume * 256 / 100;
+    frames[fill * 2] = (int16_t)(((int32_t)sample[0] * gain) >> 8);
+    frames[fill * 2 + 1] = (int16_t)(((int32_t)sample[1] * gain) >> 8);
+    if (++fill == 256) flush();
+    return true;
+  }
+  void flush() override {
+    if (!fill) return;
+    size_t written = 0;
+    i2s_write(I2S_SPK, frames, fill * 4, &written, portMAX_DELAY);
+    fill = 0;
+  }
+  bool stop() override {
+    fill = 0;
+    i2s_zero_dma_buffer(I2S_SPK);
+    if (hertz != SPK_RATE) {
+      hertz = SPK_RATE;
+      i2s_set_sample_rates(I2S_SPK, SPK_RATE);
+    }
+    return true;
+  }
+
+ private:
+  int16_t frames[512];
+  size_t fill = 0;
+};
+
+SpeakerOut radioOut;
+volatile bool radioActive = false;    // the radio task owns the speaker
+volatile bool radioStartReq = false;
+volatile bool radioStopReq = false;
+volatile bool radioFailed = false;
+String radioUrl;
+String radioName;
+bool radioPending = false;            // start once Gemini finishes talking
+uint32_t radioPendingMs = 0;
+
+void radioTask(void *) {
+  AudioFileSourceICYStream *file = nullptr;
+  AudioFileSourceBuffer *buff = nullptr;
+  AudioGeneratorMP3 *mp3 = nullptr;
+  auto cleanup = [&]() {
+    if (mp3) {
+      if (mp3->isRunning()) mp3->stop();
+      delete mp3;
+      mp3 = nullptr;
+    }
+    delete buff;
+    buff = nullptr;
+    if (file) {
+      file->close();
+      delete file;
+      file = nullptr;
+    }
+    radioOut.stop();
+  };
+  for (;;) {
+    if (radioStopReq) {
+      cleanup();
+      radioActive = false;
+      radioStopReq = false;
+    }
+    if (radioStartReq) {
+      radioStartReq = false;
+      cleanup();
+      radioActive = true;
+      Serial.printf("[radio] %s\n", radioUrl.c_str());
+      file = new AudioFileSourceICYStream(radioUrl.c_str());
+      buff = new AudioFileSourceBuffer(file, 64 * 1024);
+      mp3 = new AudioGeneratorMP3();
+      if (!file->isOpen() || !mp3->begin(buff, &radioOut)) {
+        cleanup();
+        radioActive = false;
+        radioFailed = true;
+      }
+    }
+    if (mp3 && mp3->isRunning()) {
+      if (!mp3->loop()) {
+        cleanup();
+        radioActive = false;
+        radioFailed = true;
+      }
+      vTaskDelay(1);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+  }
+}
+
+void stopRadio() {
+  radioPending = false;
+  radioStartReq = false;
+  if (!radioActive) return;
+  radioStopReq = true;
+  uint32_t t0 = millis();
+  while (radioStopReq && millis() - t0 < 3000) delay(10);
+}
+
+String jsonField(const String &obj, const char *key) {
+  String k = String("\"") + key + "\"";
+  int i = obj.indexOf(k);
+  if (i < 0) return "";
+  i += k.length();
+  int n = obj.length();
+  while (i < n && (obj[i] == ' ' || obj[i] == ':' || obj[i] == '\n')) i++;
+  if (i >= n || obj[i] != '"') return "";
+  i++;
+  String out;
+  while (i < n && obj[i] != '"') {
+    if (obj[i] == '\\' && i + 1 < n) i++;
+    out += obj[i];
+    i++;
+  }
+  return out;
+}
+
+String urlEncode(const String &in) {
+  String out;
+  const char *hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < in.length(); i++) {
+    uint8_t c = in[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.') {
+      out += (char)c;
+    } else {
+      out += '%';
+      out += hex[c >> 4];
+      out += hex[c & 15];
+    }
+  }
+  return out;
+}
+
+// Finds a playable (plain http, MP3) stream for a station name.
+bool findStation(const String &query, const String &country, String &url) {
+  const char *hosts[] = {"all.api.radio-browser.info", "de1.api.radio-browser.info"};
+  for (const char *host : hosts) {
+    String u = String("http://") + host +
+               "/json/stations/search?hidebroken=true&order=votes&reverse=true&limit=20&name=" +
+               urlEncode(query);
+    if (country.length() == 2) u += "&countrycode=" + country;
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, u);
+    http.setUserAgent("GeminiRadio/1.0");
+    http.setTimeout(8000);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    int code = http.GET();
+    if (code != 200) {
+      http.end();
+      continue;
+    }
+    String body = http.getString();
+    http.end();
+    int pos = 0;
+    for (;;) {
+      int s = body.indexOf("\"changeuuid\"", pos);
+      if (s < 0) break;
+      int e = body.indexOf("\"changeuuid\"", s + 1);
+      if (e < 0) e = body.length();
+      String obj = body.substring(s, e);
+      pos = e;
+      String codec = jsonField(obj, "codec");
+      codec.toUpperCase();
+      if (codec != "MP3") continue;
+      String cand = jsonField(obj, "url_resolved");
+      if (!cand.startsWith("http://")) cand = jsonField(obj, "url");
+      if (!cand.startsWith("http://")) continue;
+      url = cand;
+      return true;
+    }
+    return false;  // directory answered, nothing playable
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------- Gemini
 extern bool recording;
 extern bool gateOpen;
@@ -290,7 +497,19 @@ void sendSetup() {
          "\"systemInstruction\":{\"parts\":[{\"text\":\"";
   msg += SYSTEM_PROMPT;
   msg += "\"}]},"
-         "\"tools\":[{\"googleSearch\":{}}]";
+         "\"tools\":[{\"googleSearch\":{}},{\"functionDeclarations\":["
+         "{\"name\":\"play_radio\",\"description\":\"Play an internet radio station on the device speaker. "
+         "Give the station's international name in Latin letters, e.g. Nogoum FM, Radio Masr, Nile FM, Mega FM, "
+         "Quran Cairo, BBC Arabic, Monte Carlo Doualiya. If the result is not_found, try another spelling or a similar station.\","
+         "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+         "\"station\":{\"type\":\"STRING\",\"description\":\"Station name in Latin letters\"},"
+         "\"country_code\":{\"type\":\"STRING\",\"description\":\"Optional two letter country code, e.g. EG\"}},"
+         "\"required\":[\"station\"]}},"
+         "{\"name\":\"stop_radio\",\"description\":\"Stop the radio.\"},"
+         "{\"name\":\"set_volume\",\"description\":\"Set the speaker volume.\","
+         "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+         "\"level\":{\"type\":\"INTEGER\",\"description\":\"1 to 100\"}},\"required\":[\"level\"]}}"
+         "]}]";
   if (!settings.handsFree) {
     // Push-to-talk: we mark the start and end of speech ourselves.
     msg += ",\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}}";
@@ -304,6 +523,73 @@ void sendRealtime(const char *body) {
   msg += body;
   msg += "}}";
   ws.sendTXT(msg);
+}
+
+String sanitize(const String &in) {
+  String out;
+  for (size_t i = 0; i < in.length(); i++) {
+    if (in[i] != '"' && in[i] != '\\' && (uint8_t)in[i] >= 0x20) out += in[i];
+  }
+  return out;
+}
+
+void sendToolResponse(const String &id, const String &name, const String &result) {
+  String msg = "{\"toolResponse\":{\"functionResponses\":[{\"id\":\"" + sanitize(id) + "\",\"name\":\"" +
+               sanitize(name) + "\",\"response\":{\"result\":\"" + sanitize(result) + "\"}}]}}";
+  ws.sendTXT(msg);
+}
+
+int jsonInt(const String &obj, const char *key, int fallback) {
+  String k = String("\"") + key + "\"";
+  int i = obj.indexOf(k);
+  if (i < 0) return fallback;
+  i += k.length();
+  while (i < (int)obj.length() && (obj[i] == ' ' || obj[i] == ':')) i++;
+  return atoi(obj.c_str() + i);
+}
+
+void handleToolCall(const char *msg) {
+  String body(strstr(msg, "\"toolCall\""));
+  int pos = 0;
+  for (;;) {
+    int s = body.indexOf("\"id\"", pos);
+    if (s < 0) break;
+    int e = body.indexOf("\"id\"", s + 1);
+    if (e < 0) e = body.length();
+    String call = body.substring(s, e);
+    pos = e;
+    String id = jsonField(call, "id");
+    String name = jsonField(call, "name");
+    Serial.printf("[tool] %s\n", name.c_str());
+    turnDone = false;
+    if (name == "play_radio") {
+      String station = jsonField(call, "station");
+      String country = jsonField(call, "country_code");
+      country.toUpperCase();
+      setState(State::Thinking, "Finding " + station);
+      drawScreen();
+      String url;
+      if (findStation(station, country, url) || (country.length() && findStation(station, "", url))) {
+        stopRadio();
+        radioUrl = url;
+        radioName = station;
+        radioPending = true;
+        radioPendingMs = millis();
+        sendToolResponse(id, name, "playing " + station);
+      } else {
+        sendToolResponse(id, name, "not_found");
+      }
+    } else if (name == "stop_radio") {
+      stopRadio();
+      sendToolResponse(id, name, "stopped");
+    } else if (name == "set_volume") {
+      settings.volume = constrain(jsonInt(call, "level", settings.volume), 1, 100);
+      saveSettings();
+      sendToolResponse(id, name, "volume " + String(settings.volume));
+    } else if (name.length()) {
+      sendToolResponse(id, name, "unknown function");
+    }
+  }
 }
 
 bool ensureDecodeBuf(size_t need) {
@@ -336,6 +622,7 @@ void handleServerMessage(char *msg, size_t len) {
     p = end + 1;
     if (recording) continue;  // user is holding the button; drop old speech
     if (gateOpen) closeGate();  // Gemini decided we finished talking
+    if (radioActive) stopRadio();
     if (!ensureDecodeBuf(b64len * 3 / 4 + 4)) continue;
     size_t outLen = 0;
     if (mbedtls_base64_decode(decodeBuf, decodeBufSize, &outLen, (const unsigned char *)start, b64len) == 0 &&
@@ -344,6 +631,10 @@ void handleServerMessage(char *msg, size_t len) {
       waitingForReply = false;
       queuePlayback(decodeBuf, outLen);
     }
+  }
+
+  if (strstr(msg, "\"toolCall\"") && !strstr(msg, "\"toolCallCancellation\"")) {
+    handleToolCall(msg);
   }
 
   if (strstr(msg, "\"interrupted\"")) {
@@ -476,7 +767,7 @@ void handsFreeChunk() {
   micLevel = (int)sqrt((double)sum / MIC_CHUNK_SAMPLES);
   uint32_t now = millis();
 
-  bool speakerBusy = !playbackIdle() || now - lastPlaybackMs < ECHO_GUARD_MS;
+  bool speakerBusy = !playbackIdle() || radioActive || radioPending || radioStartReq || now - lastPlaybackMs < ECHO_GUARD_MS;
   if (speakerBusy || !sessionReady) {
     // Half duplex: never send our own speaker sound back to Gemini.
     prerollCount = 0;
@@ -538,6 +829,7 @@ void readMic() {
 }
 
 void startTalking() {
+  stopRadio();
   flushPlayback = true;  // barge-in: stop whatever Gemini is saying
   micFill = 0;
   i2s_start(I2S_MIC);
@@ -622,6 +914,7 @@ void setup() {
   playBuf = xStreamBufferCreateStatic(PLAY_BUF_BYTES, 1, storage, &playBufStruct);
   setupI2S();
   xTaskCreatePinnedToCore(playbackTask, "play", 4096, nullptr, 5, nullptr, 1);
+  xTaskCreatePinnedToCore(radioTask, "radio", 16384, nullptr, 1, nullptr, 1);
 
   // Offer the setup page for 3 seconds after power-on.
   setState(State::Boot, "Press the button now for setup (Wi-Fi, API key)");
@@ -675,7 +968,10 @@ void loop() {
   if (pressed != lastPressed && millis() - lastChange > 30) {
     lastChange = millis();
     lastPressed = pressed;
-    if (pressed && state == State::Error) {
+    if (pressed && (radioActive || radioPending)) {
+      stopRadio();
+      setState(State::Ready);
+    } else if (pressed && state == State::Error) {
       closeReason = "";
       setState(State::Connecting, "Retrying");
     } else if (settings.handsFree) {
@@ -687,7 +983,19 @@ void loop() {
     }
   }
 
-  if (!playbackIdle()) lastPlaybackMs = millis();
+  if (!playbackIdle() || radioActive) lastPlaybackMs = millis();
+
+  // Start the radio once Gemini has finished announcing it.
+  if (radioPending && ((turnDone && playbackIdle()) || millis() - radioPendingMs > 10000)) {
+    radioPending = false;
+    radioFailed = false;
+    radioStartReq = true;
+    setState(State::Radio, radioName);
+  }
+  if (radioFailed) {
+    radioFailed = false;
+    setState(State::Ready, "Radio stream failed");
+  }
 
   if (settings.handsFree) {
     readMic();
