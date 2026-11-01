@@ -1,0 +1,52 @@
+name: Gemini firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - gemini
+    paths:
+      - 'gemini-assistant/**'
+      - '.github/workflows/gemini-firmware.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('gemini-assistant/platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install platformio "esptool<5"
+
+      - name: Build
+        working-directory: gemini-assistant
+        run: pio run -e gemini
+
+      - name: Merge into one file (flash at 0x0)
+        working-directory: gemini-assistant
+        run: |
+          B=.pio/build/gemini
+          BOOT_APP0=~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin
+          mkdir -p out
+          python -m esptool --chip esp32s3 merge_bin -o out/gemini-merged-binary.bin \
+            --flash_mode keep --flash_freq keep --flash_size 16MB \
+            0x0 $B/bootloader.bin 0x8000 $B/partitions.bin 0xe000 $BOOT_APP0 0x10000 $B/firmware.bin
+          ls -l out $B/*.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gemini-firmware
+          path: gemini-assistant/out/gemini-merged-binary.bin
