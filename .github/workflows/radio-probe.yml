@@ -6,20 +6,33 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Search radio-browser and test streams
+      - name: Search and test
+        shell: bash
         run: |
+          set +e
           api=https://de1.api.radio-browser.info/json/stations
-          fmt='.[] | "\(.votes)|\(.codec)|\(.bitrate)|\(.countrycode)|\(.name)|\(.url_resolved)"'
-          echo "=== EG top"
-          curl -s -G -A probe "$api/search" -d countrycode=EG -d hidebroken=true -d order=votes -d reverse=true -d limit=80 | jq -r "$fmt" | tee -a list.txt
-          for q in "Monte Carlo" "MCD" "DW" "Deutsche Welle" "Al Arabiya" "Arabiya" "Sharq" "Middle East Radio" "Egypt" "Misr" "Cairo" "Quran"; do
+          fmt='.[] | "\(.votes)|\(.codec)|\(.countrycode)|\(.name)|\(.url_resolved)"'
+          for q in "Program" "Maspero" "Masr" "Radio Cairo" "Middle East" "Sharq" "Arabic" "DW Arabic" "Doualiya" "Arabiya" "ertu"; do
             echo "=== $q"
-            curl -s -G -A probe "$api/search" --data-urlencode "name=$q" -d hidebroken=true -d order=votes -d reverse=true -d limit=10 | jq -r "$fmt" | tee -a list.txt
+            curl -s -G -A probe "$api/search" --data-urlencode "name=$q" -d hidebroken=false -d order=votes -d reverse=true -d limit=12 | jq -r "$fmt"
           done
+          echo "=== tag ertu"
+          curl -s -G -A probe "$api/search" -d tag=ertu -d limit=20 | jq -r "$fmt"
+          echo "=== tag egyptian radio"
+          curl -s -G -A probe "$api/bytag/egyptian%20radio" | jq -r "$fmt" | head -20
           echo "##### TESTS"
-          cut -d'|' -f6 list.txt | sort -u > urls.txt
-          while read -r u; do
-            r=$(curl -s -m 8 -A probe -L -o /dev/null -D hdr.txt -w '%{http_code} %{url_effective}' --max-filesize 1 "$u" < /dev/null)
-            ct=$(grep -i '^content-type' hdr.txt | tail -1 | tr -d '\r')
+          for u in \
+            https://s2.voscast.com:7387/stream \
+            https://montecarlodoualiya128k.ice.infomaniak.ch/mc-doualiya.mp3 \
+            https://stream.live.vc.bbcmedia.co.uk/bbc_arabic_radio \
+            http://stream.live.vc.bbcmedia.co.uk/bbc_world_service \
+            https://stream.radiojar.com/s1mygd1frxquv \
+            https://stream.radiojar.com/8s5u5tpdtwzuv \
+            https://stream-159.zeno.fm/qb1zvsykm98uv \
+            https://stream.zeno.fm/qb1zvsykm98uv \
+            http://9090streaming.mobtada.com/9090FMEGYPT \
+            https://dw.audiostream.io/dw/1027/mp3/64/dw08 ; do
+            r=$(curl -s -m 6 -A probe -L -o /tmp/b -D /tmp/h -w '%{http_code} %{size_download} %{url_effective}' "$u" < /dev/null)
+            ct=$(grep -i '^content-type' /tmp/h | tail -1 | tr -d '\r')
             echo "T|$r|$ct|$u"
-          done < urls.txt
+          done
