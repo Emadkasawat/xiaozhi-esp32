@@ -10,7 +10,7 @@ on:
       - '.github/workflows/gemini-firmware.yml'
 
 permissions:
-  contents: read
+  contents: write  # publishes the "gemini-latest" release with the .bin
 
 jobs:
   build:
@@ -50,3 +50,14 @@ jobs:
         with:
           name: gemini-firmware
           path: gemini-assistant/out/gemini-merged-binary.bin
+
+      - name: Publish as release (direct .bin download)
+        if: github.ref == 'refs/heads/gemini'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete gemini-latest -y --cleanup-tag || true
+          gh release create gemini-latest gemini-assistant/out/gemini-merged-binary.bin \
+            --title "Gemini firmware (latest)" --target "${{ github.sha }}" --latest=false \
+            --notes "Flash gemini-merged-binary.bin at 0x0. Built from ${{ github.sha }}."
