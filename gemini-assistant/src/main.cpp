@@ -71,6 +71,8 @@ struct Settings {
   bool flip = false; // rotate the screen 180 degrees
   bool handsFree = false; // true: always listening; false: hold the button to talk
   int micThreshold = 400; // hands-free: mic level that counts as speech
+  String sheetUrl;        // shop sheet Apps Script web app (prices + credit ledger)
+  String sheetPassword;
 } settings;
 
 Preferences prefs;
@@ -83,6 +85,8 @@ void loadSettings() {
   settings.flip = prefs.getBool("flip", false);
   settings.handsFree = prefs.getBool("handsfree2", false);
   settings.micThreshold = prefs.getInt("micthr", 400);
+  settings.sheetUrl = prefs.getString("sheeturl", "");
+  settings.sheetPassword = prefs.getString("sheetpw", "");
   prefs.end();
   if (settings.model.isEmpty()) settings.model = DEFAULT_MODEL;
   settings.volume = constrain(settings.volume, 1, 100);
@@ -96,6 +100,8 @@ void saveSettings() {
   prefs.putBool("flip", settings.flip);
   prefs.putBool("handsfree2", settings.handsFree);
   prefs.putInt("micthr", settings.micThreshold);
+  prefs.putString("sheeturl", settings.sheetUrl);
+  prefs.putString("sheetpw", settings.sheetPassword);
   prefs.end();
 }
 
@@ -537,11 +543,46 @@ String jsonField(const String &obj, const char *key) {
   i++;
   String out;
   while (i < n && obj[i] != '"') {
-    if (obj[i] == '\\' && i + 1 < n) i++;
+    if (obj[i] == '\\' && i + 1 < n) {
+      i++;
+      char c = obj[i];
+      if (c == 'u' && i + 4 < n) {
+        uint32_t cp = strtoul(obj.substring(i + 1, i + 5).c_str(), nullptr, 16);
+        i += 5;
+        if (cp < 0x80) {
+          out += (char)cp;
+        } else if (cp < 0x800) {
+          out += (char)(0xC0 | (cp >> 6));
+          out += (char)(0x80 | (cp & 0x3F));
+        } else {
+          out += (char)(0xE0 | (cp >> 12));
+          out += (char)(0x80 | ((cp >> 6) & 0x3F));
+          out += (char)(0x80 | (cp & 0x3F));
+        }
+        continue;
+      }
+      out += c == 'n' ? ' ' : c;
+      i++;
+      continue;
+    }
     out += obj[i];
     i++;
   }
   return out;
+}
+
+// Raw (unquoted) JSON value such as a number: "amount": 150.5
+String jsonRaw(const String &obj, const char *key) {
+  String k = String("\"") + key + "\"";
+  int i = obj.indexOf(k);
+  if (i < 0) return "";
+  i += k.length();
+  int n = obj.length();
+  while (i < n && (obj[i] == ' ' || obj[i] == ':' || obj[i] == '\n')) i++;
+  if (i < n && obj[i] == '"') return jsonField(obj, key);
+  int start = i;
+  while (i < n && (isdigit(obj[i]) || obj[i] == '.' || obj[i] == '-')) i++;
+  return obj.substring(start, i);
 }
 
 String urlEncode(const String &in) {
@@ -644,7 +685,7 @@ void sendSetup() {
          "Monte Carlo Doualiya, Middle East Radio (Egyptian Sharq Al Awsat), Al Arabiya, Quran Cairo, Nogoum FM, "
          "Radio 9090, DW. Other stations are searched in a world directory. Never play a different station "
          "than the one asked for; Egyptian General Program (El Bernameg El Aam) has no online stream, so say it is "
-         "not available instead. If the result is not_found, try another spelling or a similar station.\","
+         "not available instead. If the result is not_found, try another spelling of the same station.\","
          "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
          "\"station\":{\"type\":\"STRING\",\"description\":\"Station name in Latin letters\"},"
          "\"country_code\":{\"type\":\"STRING\",\"description\":\"Optional two letter country code, e.g. EG\"}},"
@@ -652,8 +693,28 @@ void sendSetup() {
          "{\"name\":\"stop_radio\",\"description\":\"Stop the radio.\"},"
          "{\"name\":\"set_volume\",\"description\":\"Set the speaker volume.\","
          "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-         "\"level\":{\"type\":\"INTEGER\",\"description\":\"1 to 100\"}},\"required\":[\"level\"]}}"
-         "]}]";
+         "\"level\":{\"type\":\"INTEGER\",\"description\":\"1 to 100\"}},\"required\":[\"level\"]}}";
+  if (settings.sheetUrl.length()) {
+    // The shop sheet: item prices and the customers' credit ledger.
+    msg += ",{\"name\":\"shop_get_price\",\"description\":\"Look up the price of an item in the shop's price sheet. "
+           "Use the item name as the user said it, in Arabic.\","
+           "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"item\":{\"type\":\"STRING\"}},\"required\":[\"item\"]}},"
+           "{\"name\":\"shop_set_price\",\"description\":\"Set or add an item's price in Egyptian pounds.\","
+           "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"item\":{\"type\":\"STRING\"},"
+           "\"price\":{\"type\":\"NUMBER\"},\"note\":{\"type\":\"STRING\",\"description\":\"Optional, e.g. pack size\"}},"
+           "\"required\":[\"item\",\"price\"]}},"
+           "{\"name\":\"shop_add_credit\",\"description\":\"Record in the credit ledger that a customer took goods "
+           "without paying (kind=took) or paid back money (kind=paid). Amount in Egyptian pounds. "
+           "Repeat the customer name and amount back to the user after recording.\","
+           "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"customer\":{\"type\":\"STRING\"},"
+           "\"amount\":{\"type\":\"NUMBER\"},\"kind\":{\"type\":\"STRING\",\"enum\":[\"took\",\"paid\"]},"
+           "\"note\":{\"type\":\"STRING\",\"description\":\"Optional, e.g. what was taken\"}},"
+           "\"required\":[\"customer\",\"amount\",\"kind\"]}},"
+           "{\"name\":\"shop_balance\",\"description\":\"How much a customer still owes.\","
+           "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"customer\":{\"type\":\"STRING\"}},\"required\":[\"customer\"]}},"
+           "{\"name\":\"shop_debtors\",\"description\":\"List everyone who owes money and the total.\"}";
+  }
+  msg += "]}]";
   if (!settings.handsFree) {
     // Push-to-talk: we mark the start and end of speech ourselves.
     msg += ",\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}}";
@@ -690,6 +751,23 @@ int jsonInt(const String &obj, const char *key, int fallback) {
   i += k.length();
   while (i < (int)obj.length() && (obj[i] == ' ' || obj[i] == ':')) i++;
   return atoi(obj.c_str() + i);
+}
+
+// Calls the shop sheet's Apps Script web app and returns its text answer.
+String callSheet(const String &query) {
+  String url = settings.sheetUrl + (settings.sheetUrl.indexOf('?') >= 0 ? "&" : "?") +
+               "token=" + urlEncode(settings.sheetPassword) + "&" + query;
+  WiFiClientSecure client;
+  client.setCACert(GOOGLE_ROOT_CA);
+  HTTPClient http;
+  if (!http.begin(client, url)) return "sheet_unreachable";
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  int code = http.GET();
+  String body = code == 200 ? http.getString() : "sheet_error_" + String(code);
+  http.end();
+  Serial.printf("[sheet] %d %s\n", code, body.c_str());
+  return body;
 }
 
 void handleToolCall(const char *msg) {
@@ -752,6 +830,25 @@ void handleToolCall(const char *msg) {
     } else if (name == "stop_radio") {
       stopRadio();
       sendToolResponse(id, name, "stopped");
+    } else if (name.startsWith("shop_")) {
+      setState(State::Thinking, "Checking the shop sheet");
+      drawScreen();
+      String q;
+      if (name == "shop_get_price") {
+        q = "action=get_price&item=" + urlEncode(jsonField(call, "item"));
+      } else if (name == "shop_set_price") {
+        q = "action=set_price&item=" + urlEncode(jsonField(call, "item")) + "&price=" + urlEncode(jsonRaw(call, "price")) +
+            "&note=" + urlEncode(jsonField(call, "note"));
+      } else if (name == "shop_add_credit") {
+        q = "action=add_credit&customer=" + urlEncode(jsonField(call, "customer")) +
+            "&amount=" + urlEncode(jsonRaw(call, "amount")) + "&kind=" + urlEncode(jsonField(call, "kind")) +
+            "&note=" + urlEncode(jsonField(call, "note"));
+      } else if (name == "shop_balance") {
+        q = "action=balance&customer=" + urlEncode(jsonField(call, "customer"));
+      } else {
+        q = "action=debtors";
+      }
+      sendToolResponse(id, name, callSheet(q));
     } else if (name == "set_volume") {
       settings.volume = constrain(jsonInt(call, "level", settings.volume), 1, 100);
       saveSettings();
@@ -1045,6 +1142,10 @@ void runSetupPortal(bool forced) {
   wm.addParameter(&flipParam);
   wm.addParameter(&handsParam);
   wm.addParameter(&thrParam);
+  WiFiManagerParameter sheetUrlParam("sheeturl", "Shop sheet web app URL (leave empty to keep current)", "", 200);
+  WiFiManagerParameter sheetPwParam("sheetpw", "Shop sheet password (leave empty to keep current)", "", 40);
+  wm.addParameter(&sheetUrlParam);
+  wm.addParameter(&sheetPwParam);
   wm.setTitle("Gemini Setup");
   wm.setConfigPortalTimeout(forced ? 0 : 300);
 
@@ -1066,6 +1167,13 @@ void runSetupPortal(bool forced) {
   settings.handsFree = atoi(handsParam.getValue()) == 1;
   int thr = atoi(thrParam.getValue());
   if (thr > 0) settings.micThreshold = thr;
+  String sheetUrl = sheetUrlParam.getValue();
+  sheetUrl.trim();
+  if (sheetUrl == "-") settings.sheetUrl = "";  // "-" removes the sheet
+  else if (sheetUrl.startsWith("https://")) settings.sheetUrl = sheetUrl;
+  String sheetPw = sheetPwParam.getValue();
+  sheetPw.trim();
+  if (!sheetPw.isEmpty()) settings.sheetPassword = sheetPw;
   saveSettings();
 }
 
