@@ -15,7 +15,6 @@
 
 #include <Arduino.h>
 #include <AudioFileSourceBuffer.h>
-#include <AudioFileSourceICYStream.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutput.h>
 #include <HTTPClient.h>
@@ -23,6 +22,7 @@
 #include <U8g2lib.h>
 #include <WebSocketsClient.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <Wire.h>
 #include <driver/i2s.h>
@@ -314,6 +314,140 @@ class SpeakerOut : public AudioOutput {
   size_t fill = 0;
 };
 
+// Streams an http or https URL (following redirects) for the MP3 decoder.
+class NetStream : public AudioFileSource {
+ public:
+  ~NetStream() override { close(); }
+  bool open(const char *url) override {
+    String u = url;
+    for (int hop = 0; hop < 6; hop++) {
+      close();
+      bool tls = u.startsWith("https://");
+      if (!tls && !u.startsWith("http://")) return false;
+      String rest = u.substring(tls ? 8 : 7);
+      int slash = rest.indexOf('/');
+      String hostPort = slash < 0 ? rest : rest.substring(0, slash);
+      String path = slash < 0 ? "/" : rest.substring(slash);
+      int colon = hostPort.indexOf(':');
+      String host = colon < 0 ? hostPort : hostPort.substring(0, colon);
+      int port = colon < 0 ? (tls ? 443 : 80) : hostPort.substring(colon + 1).toInt();
+      if (tls) {
+        auto *c = new WiFiClientSecure();
+        c->setInsecure();  // public radio audio; nothing secret is sent
+        client = c;
+      } else {
+        client = new WiFiClient();
+      }
+      client->setTimeout(6);
+      if (!client->connect(host.c_str(), port)) return false;
+      client->print("GET " + path + " HTTP/1.0\r\nHost: " + host +
+                    "\r\nUser-Agent: GeminiRadio/1.0\r\nAccept: */*\r\nIcy-MetaData: 0\r\nConnection: close\r\n\r\n");
+      String status = client->readStringUntil('\n');
+      int sp = status.indexOf(' ');
+      int code = sp < 0 ? 0 : status.substring(sp + 1).toInt();
+      String location;
+      for (;;) {
+        String line = client->readStringUntil('\n');
+        line.trim();
+        if (line.isEmpty()) break;
+        if (line.substring(0, 9).equalsIgnoreCase("location:")) {
+          location = line.substring(9);
+          location.trim();
+        }
+      }
+      if (code >= 300 && code < 400 && location.length()) {
+        if (location.startsWith("/")) location = String(tls ? "https://" : "http://") + hostPort + location;
+        u = location;
+        continue;
+      }
+      Serial.printf("[radio] HTTP %d from %s\n", code, host.c_str());
+      if (code != 200) {
+        close();
+        return false;
+      }
+      pos = 0;
+      return true;
+    }
+    return false;
+  }
+  uint32_t read(void *data, uint32_t len) override {
+    uint8_t *p = (uint8_t *)data;
+    uint32_t got = 0;
+    uint32_t t0 = millis();
+    while (got < len && client && client->connected() && millis() - t0 < 5000) {
+      int n = client->read(p + got, len - got);
+      if (n > 0) {
+        got += n;
+      } else {
+        delay(2);
+      }
+    }
+    pos += got;
+    return got;
+  }
+  uint32_t readNonBlock(void *data, uint32_t len) override {
+    if (!client) return 0;
+    int avail = client->available();
+    if (avail <= 0) return 0;
+    int n = client->read((uint8_t *)data, min((uint32_t)avail, len));
+    if (n < 0) return 0;
+    pos += n;
+    return n;
+  }
+  bool close() override {
+    if (client) {
+      client->stop();
+      delete client;
+      client = nullptr;
+    }
+    return true;
+  }
+  bool isOpen() override { return client && (client->connected() || client->available()); }
+  uint32_t getPos() override { return pos; }
+
+ private:
+  WiFiClient *client = nullptr;
+  uint32_t pos = 0;
+};
+
+// Stations Emad asked for, checked to stream MP3 (Nov 2026).
+struct Favorite {
+  const char *name;
+  const char *aliases;  // lowercase, '|' separated
+  const char *url;
+};
+static const Favorite FAVORITES[] = {
+    {"BBC Arabic", "bbc", "https://stream.live.vc.bbcmedia.co.uk/bbc_arabic_radio"},
+    {"Monte Carlo Doualiya", "monte carlo|montecarlo|doualiya|mcd",
+     "https://montecarlodoualiya128k.ice.infomaniak.ch/mc-doualiya.mp3"},
+    {"Middle East Radio", "middle east|sharq|el sharq|al sharq", "https://s2.voscast.com:7387/stream"},
+    {"Al Arabiya", "arabiya|arabia", "https://stream.radiojar.com/s1mygd1frxquv"},
+    {"Quran Cairo", "quran|koran", "https://stream.radiojar.com/8s5u5tpdtwzuv"},
+    {"Nogoum FM", "nogoum|nogum|nujoom", "https://stream.zeno.fm/qb1zvsykm98uv"},
+    {"Radio 9090", "9090", "https://9090streaming.mobtada.com/9090FMEGYPT"},
+    {"DW", "dw|deutsche welle", "https://dw.audiostream.io/dw/1027/mp3/64/dw08"},
+};
+
+bool findFavorite(String query, String &url, String &name) {
+  query.toLowerCase();
+  for (const Favorite &f : FAVORITES) {
+    String aliases = f.aliases;
+    int start = 0;
+    while (start <= (int)aliases.length()) {
+      int bar = aliases.indexOf('|', start);
+      if (bar < 0) bar = aliases.length();
+      String alias = aliases.substring(start, bar);
+      if (alias.length() && query.indexOf(alias) >= 0) {
+        url = f.url;
+        name = f.name;
+        return true;
+      }
+      start = bar + 1;
+    }
+  }
+  return false;
+}
+
 SpeakerOut radioOut;
 volatile bool radioActive = false;    // the radio task owns the speaker
 volatile bool radioStartReq = false;
@@ -325,7 +459,7 @@ bool radioPending = false;            // start once Gemini finishes talking
 uint32_t radioPendingMs = 0;
 
 void radioTask(void *) {
-  AudioFileSourceICYStream *file = nullptr;
+  NetStream *file = nullptr;
   AudioFileSourceBuffer *buff = nullptr;
   AudioGeneratorMP3 *mp3 = nullptr;
   auto cleanup = [&]() {
@@ -354,7 +488,8 @@ void radioTask(void *) {
       cleanup();
       radioActive = true;
       Serial.printf("[radio] %s\n", radioUrl.c_str());
-      file = new AudioFileSourceICYStream(radioUrl.c_str());
+      file = new NetStream();
+      file->open(radioUrl.c_str());
       buff = new AudioFileSourceBuffer(file, 64 * 1024);
       mp3 = new AudioGeneratorMP3();
       if (!file->isOpen() || !mp3->begin(buff, &radioOut)) {
@@ -452,8 +587,8 @@ bool findStation(const String &query, const String &country, String &url) {
       codec.toUpperCase();
       if (codec != "MP3") continue;
       String cand = jsonField(obj, "url_resolved");
-      if (!cand.startsWith("http://")) cand = jsonField(obj, "url");
-      if (!cand.startsWith("http://")) continue;
+      if (!cand.startsWith("http")) cand = jsonField(obj, "url");
+      if (!cand.startsWith("http") || cand.indexOf(".m3u") >= 0 || cand.indexOf(".pls") >= 0) continue;
       url = cand;
       return true;
     }
@@ -499,8 +634,9 @@ void sendSetup() {
   msg += "\"}]},"
          "\"tools\":[{\"googleSearch\":{}},{\"functionDeclarations\":["
          "{\"name\":\"play_radio\",\"description\":\"Play an internet radio station on the device speaker. "
-         "Give the station's international name in Latin letters, e.g. Nogoum FM, Radio Masr, Nile FM, Mega FM, "
-         "Quran Cairo, BBC Arabic, Monte Carlo Doualiya. If the result is not_found, try another spelling or a similar station.\","
+         "Give the station's international name in Latin letters. Built-in favorites: BBC Arabic, "
+         "Monte Carlo Doualiya, Middle East Radio (Egyptian Sharq Al Awsat), Al Arabiya, Quran Cairo, Nogoum FM, "
+         "Radio 9090, DW. Other stations are searched in a world directory. If the result is not_found, try another spelling or a similar station.\","
          "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
          "\"station\":{\"type\":\"STRING\",\"description\":\"Station name in Latin letters\"},"
          "\"country_code\":{\"type\":\"STRING\",\"description\":\"Optional two letter country code, e.g. EG\"}},"
@@ -569,7 +705,10 @@ void handleToolCall(const char *msg) {
       setState(State::Thinking, "Finding " + station);
       drawScreen();
       String url;
-      if (findStation(station, country, url) || (country.length() && findStation(station, "", url))) {
+      String favName;
+      if (findFavorite(station, url, favName)) station = favName;
+      if (url.length() || findStation(station, country, url) ||
+          (country.length() && findStation(station, "", url))) {
         stopRadio();
         radioUrl = url;
         radioName = station;
