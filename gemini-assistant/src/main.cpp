@@ -69,7 +69,7 @@ struct Settings {
   String model;
   int volume = 70;   // 1..100
   bool flip = false; // rotate the screen 180 degrees
-  bool handsFree = true;  // always listening (no button needed)
+  bool handsFree = false; // true: always listening; false: hold the button to talk
   int micThreshold = 400; // hands-free: mic level that counts as speech
 } settings;
 
@@ -81,7 +81,7 @@ void loadSettings() {
   settings.model = prefs.getString("model", DEFAULT_MODEL);
   settings.volume = prefs.getInt("volume", 70);
   settings.flip = prefs.getBool("flip", false);
-  settings.handsFree = prefs.getBool("handsfree", true);
+  settings.handsFree = prefs.getBool("handsfree2", false);
   settings.micThreshold = prefs.getInt("micthr", 400);
   prefs.end();
   if (settings.model.isEmpty()) settings.model = DEFAULT_MODEL;
@@ -94,7 +94,7 @@ void saveSettings() {
   prefs.putString("model", settings.model);
   prefs.putInt("volume", settings.volume);
   prefs.putBool("flip", settings.flip);
-  prefs.putBool("handsfree", settings.handsFree);
+  prefs.putBool("handsfree2", settings.handsFree);
   prefs.putInt("micthr", settings.micThreshold);
   prefs.end();
 }
