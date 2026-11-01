@@ -9,7 +9,8 @@ no self-hosted server.
 - First boot opens a Wi-Fi hotspot `Gemini-Setup`; join it, open 192.168.4.1,
   pick your Wi-Fi and paste the Gemini API key. The key is stored only on the device.
 - To change settings later: press the button during the first 3 seconds after power-on.
-- Hold the talk button (GPIO47) or BOOT to speak; release to hear the answer.
+- Hands-free (default): just talk; audio is streamed only while the mic level is above the threshold, and never while the speaker plays. Press the button to stop a reply.
+- Push-to-talk (set hands-free to 0 in setup): hold the talk button (GPIO47) or BOOT to speak, release to hear the answer.
 
 `lib/WebSockets` is arduinoWebSockets 2.6.1 (LGPL-2.1) with two small local patches:
 `WEBSOCKETS_MAX_DATA_SIZE` can be overridden, and a weak `websocketsOnClose` hook

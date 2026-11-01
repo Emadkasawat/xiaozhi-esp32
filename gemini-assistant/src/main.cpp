@@ -62,6 +62,8 @@ struct Settings {
   String model;
   int volume = 70;   // 1..100
   bool flip = false; // rotate the screen 180 degrees
+  bool handsFree = true;  // always listening (no button needed)
+  int micThreshold = 400; // hands-free: mic level that counts as speech
 } settings;
 
 Preferences prefs;
@@ -72,6 +74,8 @@ void loadSettings() {
   settings.model = prefs.getString("model", DEFAULT_MODEL);
   settings.volume = prefs.getInt("volume", 70);
   settings.flip = prefs.getBool("flip", false);
+  settings.handsFree = prefs.getBool("handsfree", true);
+  settings.micThreshold = prefs.getInt("micthr", 400);
   prefs.end();
   if (settings.model.isEmpty()) settings.model = DEFAULT_MODEL;
   settings.volume = constrain(settings.volume, 1, 100);
@@ -83,6 +87,8 @@ void saveSettings() {
   prefs.putString("model", settings.model);
   prefs.putInt("volume", settings.volume);
   prefs.putBool("flip", settings.flip);
+  prefs.putBool("handsfree", settings.handsFree);
+  prefs.putInt("micthr", settings.micThreshold);
   prefs.end();
 }
 
@@ -146,8 +152,8 @@ void drawScreen() {
   String d = detail;
   if (d.isEmpty()) {
     switch (state) {
-      case State::Ready: d = "Hold the button and talk"; break;
-      case State::Listening: d = "Release when done"; break;
+      case State::Ready: d = settings.handsFree ? "Just talk" : "Hold the button and talk"; break;
+      case State::Listening: d = settings.handsFree ? "" : "Release when done"; break;
       case State::Thinking: d = "Waiting for Gemini"; break;
       case State::Speaking: d = "Press to interrupt"; break;
       default: break;
@@ -250,6 +256,10 @@ bool playbackIdle() {
 }
 
 // ---------------------------------------------------------------- Gemini
+extern bool recording;
+extern bool gateOpen;
+void closeGate();
+
 WebSocketsClient ws;
 String wsPath;
 bool sessionReady = false;
@@ -280,8 +290,12 @@ void sendSetup() {
          "\"systemInstruction\":{\"parts\":[{\"text\":\"";
   msg += SYSTEM_PROMPT;
   msg += "\"}]},"
-         "\"tools\":[{\"googleSearch\":{}}],"
-         "\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}}}}";
+         "\"tools\":[{\"googleSearch\":{}}]";
+  if (!settings.handsFree) {
+    // Push-to-talk: we mark the start and end of speech ourselves.
+    msg += ",\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}}";
+  }
+  msg += "}}";
   ws.sendTXT(msg);
 }
 
@@ -320,7 +334,8 @@ void handleServerMessage(char *msg, size_t len) {
     if (!end) break;
     size_t b64len = end - start;
     p = end + 1;
-    if (state == State::Listening) continue;  // user is talking; drop old speech
+    if (recording) continue;  // user is holding the button; drop old speech
+    if (gateOpen) closeGate();  // Gemini decided we finished talking
     if (!ensureDecodeBuf(b64len * 3 / 4 + 4)) continue;
     size_t outLen = 0;
     if (mbedtls_base64_decode(decodeBuf, decodeBufSize, &outLen, (const unsigned char *)start, b64len) == 0 &&
@@ -402,15 +417,28 @@ void connectGemini() {
 }
 
 // ---------------------------------------------------------------- mic
-bool recording = false;
+bool recording = false;       // push-to-talk: button held
 int16_t micChunk[MIC_CHUNK_SAMPLES];
 size_t micFill = 0;
 char *micJson = nullptr;
 size_t micJsonSize = 0;
 
-void sendMicChunk() {
-  if (micFill == 0) return;
-  size_t bytes = micFill * 2;
+// Hands-free gate: audio is only streamed while someone is speaking, so the
+// API is not billed for hours of room silence and the speaker is not heard.
+static const int PREROLL_CHUNKS = 3;          // 300 ms kept from before speech
+static const uint32_t HANG_MS = 1500;         // keep streaming after speech stops
+static const uint32_t ECHO_GUARD_MS = 600;    // ignore mic right after playback
+int16_t preroll[PREROLL_CHUNKS][MIC_CHUNK_SAMPLES];
+int prerollCount = 0;
+int prerollHead = 0;
+bool gateOpen = false;
+uint32_t lastLoudMs = 0;
+uint32_t lastPlaybackMs = 0;
+int micLevel = 0;
+
+void sendPcm(const int16_t *samples, size_t count) {
+  if (count == 0) return;
+  size_t bytes = count * 2;
   size_t b64 = 0;
   const char *head = "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"";
   const char *tail = "\"}}}";
@@ -424,9 +452,67 @@ void sendMicChunk() {
   }
   memcpy(micJson, head, headLen);
   mbedtls_base64_encode((unsigned char *)micJson + headLen, micJsonSize - headLen, &b64,
-                        (const unsigned char *)micChunk, bytes);
+                        (const unsigned char *)samples, bytes);
   strcpy(micJson + headLen + b64, tail);
   ws.sendTXT(micJson, headLen + b64 + strlen(tail));
+}
+
+uint32_t thinkingSinceMs = 0;
+
+void closeGate() {
+  if (!gateOpen) return;
+  gateOpen = false;
+  thinkingSinceMs = millis();
+  sendRealtime("\"audioStreamEnd\":true");
+  waitingForReply = true;
+  turnDone = false;
+  setState(State::Thinking);
+}
+
+// Hands-free: decide what to do with one finished 100 ms chunk.
+void handsFreeChunk() {
+  int64_t sum = 0;
+  for (size_t i = 0; i < MIC_CHUNK_SAMPLES; i++) sum += (int32_t)micChunk[i] * micChunk[i];
+  micLevel = (int)sqrt((double)sum / MIC_CHUNK_SAMPLES);
+  uint32_t now = millis();
+
+  bool speakerBusy = !playbackIdle() || now - lastPlaybackMs < ECHO_GUARD_MS;
+  if (speakerBusy || !sessionReady) {
+    // Half duplex: never send our own speaker sound back to Gemini.
+    prerollCount = 0;
+    if (gateOpen && !sessionReady) gateOpen = false;
+    return;
+  }
+
+  bool loud = micLevel > settings.micThreshold;
+  if (loud) {
+    if (!gateOpen) {
+      gateOpen = true;
+      for (int i = 0; i < prerollCount; i++) {
+        int idx = (prerollHead - prerollCount + i + PREROLL_CHUNKS) % PREROLL_CHUNKS;
+        sendPcm(preroll[idx], MIC_CHUNK_SAMPLES);
+      }
+      prerollCount = 0;
+      setState(State::Listening);
+    }
+    lastLoudMs = now;
+    sendPcm(micChunk, MIC_CHUNK_SAMPLES);
+  } else if (gateOpen) {
+    sendPcm(micChunk, MIC_CHUNK_SAMPLES);
+    if (now - lastLoudMs > HANG_MS) closeGate();
+  } else {
+    memcpy(preroll[prerollHead], micChunk, sizeof(micChunk));
+    prerollHead = (prerollHead + 1) % PREROLL_CHUNKS;
+    if (prerollCount < PREROLL_CHUNKS) prerollCount++;
+  }
+}
+
+void onMicChunk() {
+  if (settings.handsFree) {
+    handsFreeChunk();
+  } else {
+    sendPcm(micChunk, micFill);
+  }
   micFill = 0;
 }
 
@@ -447,7 +533,7 @@ void readMic() {
     if (s > 32767) s = 32767;
     if (s < -32768) s = -32768;
     micChunk[micFill++] = (int16_t)s;
-    if (micFill == MIC_CHUNK_SAMPLES) sendMicChunk();
+    if (micFill == MIC_CHUNK_SAMPLES) onMicChunk();
   }
 }
 
@@ -464,7 +550,8 @@ void startTalking() {
 void stopTalking() {
   recording = false;
   readMic();
-  sendMicChunk();
+  sendPcm(micChunk, micFill);
+  micFill = 0;
   i2s_stop(I2S_MIC);
   sendRealtime("\"activityEnd\":{}");
   waitingForReply = true;
@@ -484,10 +571,17 @@ void runSetupPortal(bool forced) {
   snprintf(volStr, sizeof(volStr), "%d", settings.volume);
   WiFiManagerParameter volParam("volume", "Volume 1-100", volStr, 4);
   WiFiManagerParameter flipParam("flip", "Flip screen (0 or 1)", settings.flip ? "1" : "0", 2);
+  WiFiManagerParameter handsParam("handsfree", "Hands-free, always listening (1) or push-to-talk (0)",
+                                  settings.handsFree ? "1" : "0", 2);
+  char thrStr[8];
+  snprintf(thrStr, sizeof(thrStr), "%d", settings.micThreshold);
+  WiFiManagerParameter thrParam("micthr", "Hands-free mic threshold (lower = more sensitive)", thrStr, 6);
   wm.addParameter(&keyParam);
   wm.addParameter(&modelParam);
   wm.addParameter(&volParam);
   wm.addParameter(&flipParam);
+  wm.addParameter(&handsParam);
+  wm.addParameter(&thrParam);
   wm.setTitle("Gemini Setup");
   wm.setConfigPortalTimeout(forced ? 0 : 300);
 
@@ -506,6 +600,9 @@ void runSetupPortal(bool forced) {
   }
   settings.volume = constrain(atoi(volParam.getValue()), 1, 100);
   settings.flip = atoi(flipParam.getValue()) == 1;
+  settings.handsFree = atoi(handsParam.getValue()) == 1;
+  int thr = atoi(thrParam.getValue());
+  if (thr > 0) settings.micThreshold = thr;
   saveSettings();
 }
 
@@ -562,6 +659,7 @@ void setup() {
     return;
   }
   connectGemini();
+  if (settings.handsFree) i2s_start(I2S_MIC);
 }
 
 void loop() {
@@ -577,21 +675,47 @@ void loop() {
   if (pressed != lastPressed && millis() - lastChange > 30) {
     lastChange = millis();
     lastPressed = pressed;
-    if (pressed && sessionReady) {
+    if (pressed && state == State::Error) {
+      closeReason = "";
+      setState(State::Connecting, "Retrying");
+    } else if (settings.handsFree) {
+      if (pressed && state == State::Speaking) flushPlayback = true;  // stop talking
+    } else if (pressed && sessionReady) {
       startTalking();
     } else if (!pressed && recording) {
       stopTalking();
-    } else if (pressed && state == State::Error) {
-      closeReason = "";
-      setState(State::Connecting, "Retrying");
     }
   }
 
-  if (recording) {
+  if (!playbackIdle()) lastPlaybackMs = millis();
+
+  if (settings.handsFree) {
     readMic();
-  } else if (sessionReady && turnDone && playbackIdle() &&
-             (state == State::Speaking || state == State::Thinking)) {
+  } else if (recording) {
+    readMic();
+  }
+  if (!recording && !gateOpen && sessionReady && turnDone && playbackIdle() &&
+      (state == State::Speaking || state == State::Thinking)) {
     setState(State::Ready);
+  }
+  // Hands-free: a noise that was not speech gets no answer; stop waiting.
+  if (settings.handsFree && state == State::Thinking && millis() - thinkingSinceMs > 10000) {
+    turnDone = true;
+    setState(State::Ready);
+  }
+
+  // Hands-free: show the mic level while idle, to help tune the threshold.
+  static uint32_t lastLevelDraw = 0;
+  if (settings.handsFree && state == State::Ready && millis() - lastLevelDraw > 500) {
+    lastLevelDraw = millis();
+    oled.setDrawColor(0);
+    oled.drawBox(0, 54, 128, 10);
+    oled.setDrawColor(1);
+    oled.setFont(u8g2_font_6x10_tr);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Mic %d / %d", micLevel, settings.micThreshold);
+    oled.drawStr(0, 63, buf);
+    oled.sendBuffer();
   }
 
   if (WiFi.status() != WL_CONNECTED && state != State::Error) {
