@@ -1,0 +1,23 @@
+name: Radio probe
+on:
+  push:
+    branches: [radio-probe]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Search radio-browser and test streams
+        run: |
+          for q in "General Program" "Egyptian Radio" "ERTU" "Middle East" "Sharq Al Awsat" "الشرق الأوسط" "البرنامج العام" "BBC Arabic" "Al Arabiya" "العربية" "Radio Masr" "Nogoum" "Quran Cairo"; do
+            echo "=== $q"
+            curl -s -G -A probe "https://de1.api.radio-browser.info/json/stations/search" \
+              --data-urlencode "name=$q" -d hidebroken=true -d order=votes -d reverse=true -d limit=8 |
+              jq -r '.[] | "\(.votes)|\(.codec)|\(.bitrate)|\(.countrycode)|\(.name)|\(.url_resolved)|\(.url)"'
+          done > list.txt
+          cat list.txt
+          echo "##### TESTS"
+          grep -v '^===' list.txt | cut -d'|' -f6,7 | tr '|' '\n' | sort -u | while read u; do
+            h=$(curl -s -m 6 -A probe -D - -o /dev/null -r 0-2000 "$u" 2>/dev/null | grep -i -m1 '^content-type' | tr -d '\r')
+            code=$(curl -s -m 6 -A probe -o /dev/null -w '%{http_code} %{url_effective}' "$u" -r 0-100 2>/dev/null)
+            echo "$code | $h | $u"
+          done
