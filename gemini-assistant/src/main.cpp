@@ -64,6 +64,8 @@ static const char *SYSTEM_PROMPT =
     "لو طلب راديو أو محطة استخدم play_radio، وقول جملة قصيرة جدًا قبل التشغيل. "
     "وقف الراديو بـ stop_radio، وغيّر الصوت بـ set_volume. "
     "لو طلب منبه أو تذكير استخدم set_reminder، واكتب نص التذكير بنفس كلام المستخدم من غير تغيير. "
+    "لو طلب تأجيل التذكير اللي لسه رن استخدم snooze_reminder. "
+    "لو قال إن زبون هيدفع في يوم معين استخدم shop_payment_due. "
     "لو سأل الساعة كام أو التاريخ استخدم get_time.";
 
 // ---------------------------------------------------------------- settings
@@ -652,34 +654,69 @@ bool findStation(const String &query, const String &country, String &url) {
 // (Egypt time, with summer time).
 static const char *EGYPT_TZ = "EET-2EEST,M4.5.5/0,M10.5.4/24";
 
+enum RepeatKind : uint8_t { REPEAT_NONE = 0, REPEAT_DAILY = 1, REPEAT_WEEKLY = 2, REPEAT_MONTHLY = 3 };
+enum ReminderKind : uint8_t { KIND_NOTE = 0, KIND_PAYMENT = 1 };
+
 struct Reminder {
   uint32_t at;     // unix time of the next ring
   uint8_t used;
-  uint8_t daily;
-  uint16_t hhmm;   // for daily repeats
+  uint8_t repeat;  // RepeatKind
+  uint16_t hhmm;
+  uint8_t wdays;   // weekly: bit 0 = Sunday ... bit 6 = Saturday
+  uint8_t mday;    // monthly: day of month
+  uint8_t kind;    // ReminderKind; for KIND_PAYMENT text is the customer
+  uint8_t pad;
   char text[160];
 };
+
+// Layout used by the first alarm build, kept to carry old alarms over.
+struct ReminderV1 {
+  uint32_t at;
+  uint8_t used;
+  uint8_t daily;
+  uint16_t hhmm;
+  char text[160];
+};
+
 static const int MAX_REMINDERS = 12;
 Reminder reminders[MAX_REMINDERS];
-String pendingReminder;  // text waiting to be spoken
+String pendingReminder;   // text (or customer) waiting to be spoken
+uint8_t pendingKind = KIND_NOTE;
+String lastFiredText;     // for snooze
+uint8_t lastFiredKind = KIND_NOTE;
+uint32_t lastFiredMs = 0;
+
+void saveReminders() {
+  prefs.begin("gemini", false);
+  prefs.putBytes("rem2", reminders, sizeof(reminders));
+  prefs.end();
+}
 
 void loadReminders() {
   memset(reminders, 0, sizeof(reminders));
   prefs.begin("gemini", true);
-  if (prefs.getBytesLength("rem") == sizeof(reminders)) prefs.getBytes("rem", reminders, sizeof(reminders));
+  bool haveV2 = prefs.getBytesLength("rem2") == sizeof(reminders);
+  if (haveV2) prefs.getBytes("rem2", reminders, sizeof(reminders));
+  static ReminderV1 old[MAX_REMINDERS];
+  bool haveV1 = !haveV2 && prefs.getBytesLength("rem") == sizeof(old);
+  if (haveV1) prefs.getBytes("rem", old, sizeof(old));
   prefs.end();
-}
-
-void saveReminders() {
-  prefs.begin("gemini", false);
-  prefs.putBytes("rem", reminders, sizeof(reminders));
-  prefs.end();
+  if (haveV1) {
+    for (int i = 0; i < MAX_REMINDERS; i++) {
+      reminders[i].at = old[i].at;
+      reminders[i].used = old[i].used;
+      reminders[i].repeat = old[i].daily ? REPEAT_DAILY : REPEAT_NONE;
+      reminders[i].hhmm = old[i].hhmm;
+      memcpy(reminders[i].text, old[i].text, sizeof(old[i].text));
+    }
+    saveReminders();
+  }
 }
 
 bool clockOk() { return time(nullptr) > 1700000000; }
 
-// Next time the clock shows hh:mm, `days` days from today (0 = next one).
-time_t nextAt(int hh, int mm, int days) {
+// hh:mm on the day `days` days from today (no rolling over).
+time_t atDay(int hh, int mm, int days) {
   time_t now = time(nullptr);
   struct tm t;
   localtime_r(&now, &t);
@@ -688,13 +725,69 @@ time_t nextAt(int hh, int mm, int days) {
   t.tm_sec = 0;
   t.tm_mday += days;
   t.tm_isdst = -1;
-  time_t ts = mktime(&t);
-  if (days == 0 && ts <= now) {
-    t.tm_mday += 1;
-    t.tm_isdst = -1;
-    ts = mktime(&t);
-  }
+  return mktime(&t);
+}
+
+// Next time the clock shows hh:mm, `days` days from today (0 = next one).
+time_t nextAt(int hh, int mm, int days) {
+  time_t ts = atDay(hh, mm, days);
+  if (days == 0 && ts <= time(nullptr)) ts = atDay(hh, mm, 1);
   return ts;
+}
+
+int weekdayOf(time_t ts) {
+  struct tm t;
+  localtime_r(&ts, &t);
+  return t.tm_wday;
+}
+
+// Next ring after now for a repeating reminder (or 0 if none).
+time_t nextOccurrence(const Reminder &r) {
+  int hh = r.hhmm / 100, mm = r.hhmm % 100;
+  time_t now = time(nullptr);
+  if (r.repeat == REPEAT_DAILY) return nextAt(hh, mm, 0);
+  if (r.repeat == REPEAT_WEEKLY) {
+    for (int d = 0; d <= 7; d++) {
+      time_t ts = atDay(hh, mm, d);
+      if (ts > now && (r.wdays & (1 << weekdayOf(ts)))) return ts;
+    }
+    return 0;
+  }
+  if (r.repeat == REPEAT_MONTHLY) {
+    struct tm base;
+    localtime_r(&now, &base);
+    for (int m = 0; m <= 12; m++) {
+      struct tm t = {};
+      t.tm_year = base.tm_year;
+      t.tm_mon = base.tm_mon + m;
+      t.tm_mday = 1;
+      t.tm_isdst = -1;
+      mktime(&t);  // normalise year/month
+      static const int dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+      int y = t.tm_year + 1900;
+      int days = dim[t.tm_mon] + (t.tm_mon == 1 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0));
+      t.tm_mday = min((int)r.mday, days);
+      t.tm_hour = hh;
+      t.tm_min = mm;
+      t.tm_sec = 0;
+      t.tm_isdst = -1;
+      time_t ts = mktime(&t);
+      if (ts > now) return ts;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+// "sat,mon" or "saturday" (English) -> bit mask, bit 0 = Sunday.
+uint8_t parseWeekdays(String s) {
+  s.toLowerCase();
+  static const char *names[] = {"sun", "mon", "tue", "wed", "thu", "fri", "sat"};
+  uint8_t mask = 0;
+  for (int i = 0; i < 7; i++) {
+    if (s.indexOf(names[i]) >= 0) mask |= 1 << i;
+  }
+  return mask;
 }
 
 String fmtTime(time_t ts) {
@@ -705,16 +798,91 @@ String fmtTime(time_t ts) {
   return buf;
 }
 
+String describeRepeat(const Reminder &r) {
+  static const char *names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  switch (r.repeat) {
+    case REPEAT_DAILY: return " every day";
+    case REPEAT_WEEKLY: {
+      String d = " every";
+      for (int i = 0; i < 7; i++)
+        if (r.wdays & (1 << i)) d += String(" ") + names[i];
+      return d;
+    }
+    case REPEAT_MONTHLY: return " every month on day " + String(r.mday);
+  }
+  return "";
+}
+
 String listReminders() {
   String out;
   int n = 0;
   for (int i = 0; i < MAX_REMINDERS; i++) {
-    if (!reminders[i].used) continue;
+    const Reminder &r = reminders[i];
+    if (!r.used) continue;
     n++;
-    out += String(i + 1) + ") " + fmtTime(reminders[i].at) + (reminders[i].daily ? " daily" : "") + ": " +
-           reminders[i].text + ". ";
+    out += String(i + 1) + ") " + fmtTime(r.at) + describeRepeat(r) + ": " +
+           (r.kind == KIND_PAYMENT ? String("payment due from ") : String("")) + r.text + ". ";
   }
   return n ? out : "no reminders";
+}
+
+int freeReminderSlot() {
+  for (int i = 0; i < MAX_REMINDERS; i++)
+    if (!reminders[i].used) return i;
+  return -1;
+}
+
+// Fills the timing of `r` from a set_reminder / shop_payment_due call.
+// Returns "" on success or the problem to report back to Gemini.
+String scheduleFromCall(const String &call, Reminder &r, const char *defaultTime) {
+  String hhmm = jsonField(call, "time");
+  if (hhmm.isEmpty() && defaultTime) hhmm = defaultTime;
+  int inMin = jsonRaw(call, "in_minutes").toInt();
+  int days = max(0, (int)jsonRaw(call, "days_from_today").toInt());
+  String repeat = jsonField(call, "repeat");
+  if (repeat.isEmpty() && jsonRaw(call, "daily") == "true") repeat = "daily";
+  uint8_t wdays = parseWeekdays(jsonField(call, "weekdays") + "," + jsonField(call, "weekday"));
+  int mday = jsonRaw(call, "day_of_month").toInt();
+
+  if (inMin > 0) {
+    r.at = time(nullptr) + inMin * 60;
+    time_t at = r.at;
+    struct tm t;
+    localtime_r(&at, &t);
+    r.hhmm = t.tm_hour * 100 + t.tm_min;
+    r.repeat = REPEAT_NONE;
+    return "";
+  }
+  int hh = -1, mm = -1;
+  if (hhmm.length()) sscanf(hhmm.c_str(), "%d:%d", &hh, &mm);
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return "need time HH:MM or in_minutes";
+  r.hhmm = hh * 100 + mm;
+
+  if (repeat == "daily") {
+    r.repeat = REPEAT_DAILY;
+  } else if (repeat == "weekly") {
+    if (!wdays) return "weekly needs weekdays, e.g. sat,mon";
+    r.repeat = REPEAT_WEEKLY;
+    r.wdays = wdays;
+  } else if (repeat == "monthly") {
+    if (mday < 1 || mday > 31) return "monthly needs day_of_month 1-31";
+    r.repeat = REPEAT_MONTHLY;
+    r.mday = mday;
+  } else if (wdays) {
+    // One time, on the next given weekday.
+    Reminder tmp = r;
+    tmp.repeat = REPEAT_WEEKLY;
+    tmp.wdays = wdays;
+    r.at = nextOccurrence(tmp);
+    r.repeat = REPEAT_NONE;
+    return r.at ? "" : "could not work out the date";
+  } else {
+    r.repeat = REPEAT_NONE;
+    r.at = nextAt(hh, mm, days);
+    return "";
+  }
+  r.at = nextOccurrence(r);
+  return r.at ? "" : "could not work out the date";
 }
 
 // ---------------------------------------------------------------- Gemini
@@ -766,15 +934,22 @@ void sendSetup() {
          "{\"name\":\"stop_radio\",\"description\":\"Stop the radio.\"},"
          "{\"name\":\"get_time\",\"description\":\"Current local date and time in Egypt.\"},"
          "{\"name\":\"set_reminder\",\"description\":\"Set an alarm/reminder. At that time the device plays a "
-         "notification sound and you will be asked to say the message. Give either time (HH:MM, 24h, Egypt time, "
-         "optionally with days_from_today) or in_minutes.\","
+         "notification sound and you will be asked to say the message. Give in_minutes, or time (HH:MM, 24h, Egypt "
+         "time) with optionally days_from_today or weekday for a one-time reminder, or repeat for a repeating one.\","
          "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
          "\"message\":{\"type\":\"STRING\",\"description\":\"What to remind about, in the user's exact words\"},"
          "\"time\":{\"type\":\"STRING\",\"description\":\"HH:MM 24-hour\"},"
          "\"days_from_today\":{\"type\":\"INTEGER\",\"description\":\"0 today or next, 1 tomorrow...\"},"
+         "\"weekday\":{\"type\":\"STRING\",\"description\":\"One time on the next sun/mon/tue/wed/thu/fri/sat\"},"
          "\"in_minutes\":{\"type\":\"INTEGER\"},"
-         "\"daily\":{\"type\":\"BOOLEAN\",\"description\":\"Repeat every day\"}},"
+         "\"repeat\":{\"type\":\"STRING\",\"enum\":[\"none\",\"daily\",\"weekly\",\"monthly\"]},"
+         "\"weekdays\":{\"type\":\"STRING\",\"description\":\"For weekly: comma list of sun,mon,tue,wed,thu,fri,sat\"},"
+         "\"day_of_month\":{\"type\":\"INTEGER\",\"description\":\"For monthly: 1-31\"}},"
          "\"required\":[\"message\"]}},"
+         "{\"name\":\"snooze_reminder\",\"description\":\"Ring the reminder that just rang again after some minutes "
+         "(snooze), e.g. when the user says remind me again in 10 minutes.\","
+         "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"minutes\":{\"type\":\"INTEGER\"}},"
+         "\"required\":[\"minutes\"]}},"
          "{\"name\":\"list_reminders\",\"description\":\"List the alarms/reminders with their numbers.\"},"
          "{\"name\":\"cancel_reminder\",\"description\":\"Cancel a reminder by its number from list_reminders, or 0 for all.\","
          "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"number\":{\"type\":\"INTEGER\"}},"
@@ -800,7 +975,15 @@ void sendSetup() {
            "\"required\":[\"customer\",\"amount\",\"kind\"]}},"
            "{\"name\":\"shop_balance\",\"description\":\"How much a customer still owes.\","
            "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"customer\":{\"type\":\"STRING\"}},\"required\":[\"customer\"]}},"
-           "{\"name\":\"shop_debtors\",\"description\":\"List everyone who owes money and the total.\"}";
+           "{\"name\":\"shop_debtors\",\"description\":\"List everyone who owes money and the total.\"},"
+           "{\"name\":\"shop_payment_due\",\"description\":\"Remember the day a customer promised to pay. On that "
+           "day the device reminds the user and reads the customer's current balance from the ledger. Give "
+           "weekday or days_from_today; time defaults to 10:00.\","
+           "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"customer\":{\"type\":\"STRING\"},"
+           "\"weekday\":{\"type\":\"STRING\",\"description\":\"sun/mon/tue/wed/thu/fri/sat\"},"
+           "\"days_from_today\":{\"type\":\"INTEGER\"},"
+           "\"time\":{\"type\":\"STRING\",\"description\":\"HH:MM 24-hour, optional\"}},"
+           "\"required\":[\"customer\"]}}";
   }
   msg += "]}]";
   if (!settings.handsFree) {
@@ -939,46 +1122,48 @@ void handleToolCall(const char *msg) {
       sendToolResponse(id, name, callSheet(q));
     } else if (name == "get_time") {
       sendToolResponse(id, name, clockOk() ? "now " + fmtTime(time(nullptr)) : "clock not synced yet");
-    } else if (name == "set_reminder") {
-      String text = jsonField(call, "message");
-      String hhmm = jsonField(call, "time");
-      int inMin = jsonRaw(call, "in_minutes").toInt();
-      int days = jsonRaw(call, "days_from_today").toInt();
-      bool daily = jsonRaw(call, "daily") == "true";
-      int slot = -1;
-      for (int i = 0; i < MAX_REMINDERS; i++) {
-        if (!reminders[i].used) {
-          slot = i;
-          break;
-        }
-      }
-      int hh = -1, mm = -1;
-      if (hhmm.length()) sscanf(hhmm.c_str(), "%d:%d", &hh, &mm);
+    } else if (name == "set_reminder" || name == "shop_payment_due") {
+      bool payment = name == "shop_payment_due";
+      String text = jsonField(call, payment ? "customer" : "message");
+      int slot = freeReminderSlot();
       if (!clockOk()) {
         sendToolResponse(id, name, "clock not synced yet, try again in a minute");
       } else if (slot < 0) {
         sendToolResponse(id, name, "reminder list is full (12), cancel one first");
-      } else if (inMin <= 0 && (hh < 0 || hh > 23 || mm < 0 || mm > 59)) {
-        sendToolResponse(id, name, "need time HH:MM or in_minutes");
+      } else if (text.isEmpty()) {
+        sendToolResponse(id, name, payment ? "need the customer name" : "need the message");
       } else {
-        Reminder &r = reminders[slot];
-        memset(&r, 0, sizeof(r));
+        Reminder r = {};
         r.used = 1;
-        if (inMin > 0) {
-          r.at = time(nullptr) + inMin * 60;
-          struct tm t;
-          time_t at = r.at;
-          localtime_r(&at, &t);
-          r.hhmm = t.tm_hour * 100 + t.tm_min;
-        } else {
-          r.at = nextAt(hh, mm, max(days, 0));
-          r.hhmm = hh * 100 + mm;
-        }
-        r.daily = daily ? 1 : 0;
+        r.kind = payment ? KIND_PAYMENT : KIND_NOTE;
         strlcpy(r.text, text.c_str(), sizeof(r.text));
+        String err = scheduleFromCall(call, r, payment ? "10:00" : nullptr);
+        if (err.length()) {
+          sendToolResponse(id, name, err);
+        } else {
+          reminders[slot] = r;
+          saveReminders();
+          sendToolResponse(id, name, "reminder " + String(slot + 1) + " set for " + fmtTime(r.at) +
+                                         describeRepeat(r) + ", now is " + fmtTime(time(nullptr)));
+        }
+      }
+    } else if (name == "snooze_reminder") {
+      int minutes = jsonRaw(call, "minutes").toInt();
+      if (minutes <= 0) minutes = 10;
+      int slot = freeReminderSlot();
+      if (lastFiredText.isEmpty() || millis() - lastFiredMs > 2 * 3600 * 1000UL) {
+        sendToolResponse(id, name, "no reminder rang recently; use set_reminder instead");
+      } else if (slot < 0) {
+        sendToolResponse(id, name, "reminder list is full (12), cancel one first");
+      } else {
+        Reminder r = {};
+        r.used = 1;
+        r.kind = lastFiredKind;
+        r.at = time(nullptr) + minutes * 60;
+        strlcpy(r.text, lastFiredText.c_str(), sizeof(r.text));
+        reminders[slot] = r;
         saveReminders();
-        sendToolResponse(id, name, "reminder " + String(slot + 1) + " set for " + fmtTime(r.at) +
-                                       (daily ? " every day" : "") + ", now is " + fmtTime(time(nullptr)));
+        sendToolResponse(id, name, "snoozed " + String(minutes) + " minutes, will ring at " + fmtTime(r.at));
       }
     } else if (name == "list_reminders") {
       sendToolResponse(id, name, listReminders());
@@ -1305,9 +1490,11 @@ void checkReminders() {
       Reminder &r = reminders[i];
       if (!r.used || r.at > now) continue;
       pendingReminder = r.text;
+      pendingKind = r.kind;
       if (now - r.at > 120) pendingReminder += " (this reminder was missed while the device was off)";
-      if (r.daily) {
-        r.at = nextAt(r.hhmm / 100, r.hhmm % 100, 0);
+      time_t next = r.repeat != REPEAT_NONE ? nextOccurrence(r) : 0;
+      if (next) {
+        r.at = next;
       } else {
         r.used = 0;
       }
@@ -1322,11 +1509,25 @@ void checkReminders() {
     while (flushPlayback && millis() - t0 < 500) delay(5);
     queueChime();
     turnDone = false;
-    setState(State::Speaking, "Reminder");
-    sendClientText(
-        "[Reminder from the device alarm] Say to the user, in Egyptian Arabic, the word تذكير then exactly this "
-        "reminder in the same words, nothing else: " +
-        pendingReminder);
+    lastFiredText = pendingReminder;
+    lastFiredKind = pendingKind;
+    lastFiredMs = millis();
+    if (pendingKind == KIND_PAYMENT) {
+      setState(State::Speaking, "Payment due");
+      drawScreen();
+      String balance = settings.sheetUrl.length()
+                           ? callSheet("action=balance&customer=" + urlEncode(pendingReminder))
+                           : String("ledger not connected");
+      sendClientText("[Payment due reminder from the device alarm] Tell the user briefly in Egyptian Arabic, "
+                     "starting with the word تذكير, that today the customer " + pendingReminder +
+                     " is supposed to pay, and how much they owe according to the ledger: " + balance);
+    } else {
+      setState(State::Speaking, "Reminder");
+      sendClientText(
+          "[Reminder from the device alarm] Say to the user, in Egyptian Arabic, the word تذكير then exactly this "
+          "reminder in the same words, nothing else: " +
+          pendingReminder);
+    }
     pendingReminder = "";
   }
 }
