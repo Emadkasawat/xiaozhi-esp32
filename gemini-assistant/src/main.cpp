@@ -160,6 +160,8 @@ void drawWrapped(const String &text, int y, int width, int lineHeight, int maxLi
   }
 }
 
+String radioNote;  // last radio problem, kept on the Ready screen
+
 void drawScreen() {
   if (!screenDirty) return;
   screenDirty = false;
@@ -171,7 +173,9 @@ void drawScreen() {
   String d = detail;
   if (d.isEmpty()) {
     switch (state) {
-      case State::Ready: d = settings.handsFree ? "Just talk" : "Hold the button and talk"; break;
+      case State::Ready:
+        d = radioNote.length() ? radioNote : String(settings.handsFree ? "Just talk" : "Hold the button and talk");
+        break;
       case State::Listening: d = settings.handsFree ? "" : "Release when done"; break;
       case State::Thinking: d = "Waiting for Gemini"; break;
       case State::Speaking: d = "Press to interrupt"; break;
@@ -278,6 +282,12 @@ bool playbackIdle() {
 // ---------------------------------------------------------------- radio
 // Internet radio: Gemini calls play_radio(station); we look the station up in
 // the public radio-browser.info directory and stream its MP3 to the speaker.
+// Radio diagnostics shown on the screen while a station plays.
+volatile uint32_t radioSamples = 0;   // decoded samples sent to the speaker
+volatile uint32_t radioNetBytes = 0;  // bytes received from the station
+volatile int radioHttp = 0;           // last HTTP status from the station
+volatile int radioRate = 0;           // sample rate the decoder reported
+
 class SpeakerOut : public AudioOutput {
  public:
   SpeakerOut() {
@@ -290,6 +300,7 @@ class SpeakerOut : public AudioOutput {
     return true;
   }
   bool SetRate(int hz) override {
+    radioRate = hz;
     if (hz != hertz) {
       hertz = hz;
       i2s_set_sample_rates(I2S_SPK, hz);
@@ -308,6 +319,7 @@ class SpeakerOut : public AudioOutput {
     frames[fill * 2] = (int16_t)(((int32_t)sample[0] * gain) >> 8);
     frames[fill * 2 + 1] = (int16_t)(((int32_t)sample[1] * gain) >> 8);
     fill++;
+    radioSamples++;
     return true;
   }
   void flush() override {
@@ -378,6 +390,7 @@ class NetStream : public AudioFileSource {
         continue;
       }
       Serial.printf("[radio] HTTP %d from %s\n", code, host.c_str());
+      radioHttp = code;
       if (code != 200) {
         close();
         return false;
@@ -400,6 +413,7 @@ class NetStream : public AudioFileSource {
       }
     }
     pos += got;
+    radioNetBytes += got;
     return got;
   }
   uint32_t readNonBlock(void *data, uint32_t len) override {
@@ -409,6 +423,7 @@ class NetStream : public AudioFileSource {
     int n = client->read((uint8_t *)data, min((uint32_t)avail, len));
     if (n < 0) return 0;
     pos += n;
+    radioNetBytes += n;
     return n;
   }
   bool close() override {
@@ -470,6 +485,12 @@ volatile bool radioActive = false;    // the radio task owns the speaker
 volatile bool radioStartReq = false;
 volatile bool radioStopReq = false;
 volatile bool radioFailed = false;
+uint32_t radioStartedMs = 0;
+
+String radioDiag() {
+  return "net " + String(radioNetBytes / 1024) + "KB http " + String(radioHttp) + " audio " +
+         String(radioSamples / 1000) + "k " + String(radioRate / 1000) + "kHz vol " + String(settings.volume);
+}
 String radioUrl;
 String radioName;
 bool radioPending = false;            // start once Gemini finishes talking
@@ -1684,14 +1705,39 @@ void loop() {
   if (radioPending && ((turnDone && playbackIdle()) || millis() - radioPendingMs > 10000)) {
     radioPending = false;
     radioFailed = false;
+    radioNote = "";
+    radioSamples = radioNetBytes = 0;
+    radioHttp = radioRate = 0;
+    radioStartedMs = millis();
     radioStartReq = true;
     setState(State::Radio, radioName);
   }
   checkReminders();
 
+  // While the radio plays, show what is happening; give up if no sound comes.
+  static uint32_t lastRadioDraw = 0;
+  if (state == State::Radio && millis() - lastRadioDraw > 1000) {
+    lastRadioDraw = millis();
+    setState(State::Radio, radioName + " " + radioDiag());
+    if (radioActive && radioSamples == 0 && millis() - radioStartedMs > 12000) {
+      Serial.printf("[radio] no audio: %s\n", radioDiag().c_str());
+      stopRadio();
+      radioFailed = true;
+    }
+  }
   if (radioFailed) {
     radioFailed = false;
-    setState(State::Ready, "Radio stream failed");
+    String why = radioHttp == 0     ? "could not connect"
+                 : radioHttp != 200 ? "station answered HTTP " + String(radioHttp)
+                 : radioNetBytes == 0 ? "station sent no data"
+                                      : "data came but it is not MP3 audio";
+    radioNote = "Radio failed: " + why + " | " + radioDiag();
+    setState(State::Ready, radioNote);
+    if (sessionReady) {
+      turnDone = false;
+      sendClientText("[device] The radio station " + radioName + " did not play (" + why +
+                     "). Tell the user briefly in Egyptian Arabic that it did not work.");
+    }
   }
 
   if (settings.handsFree) {
