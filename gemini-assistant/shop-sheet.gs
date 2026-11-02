@@ -54,7 +54,72 @@ function norm(s) {
     .replace(/[أإآ]/g, 'ا')
     .replace(/ة/g, 'ه')
     .replace(/ى/g, 'ي')
-    .replace(/\s+/g, ' ');
+    .replace(/[٠-٩]/g, d => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Words of a name, without the Arabic article "ال" and "و" glued in front.
+function words(s) {
+  return norm(s).split(' ').filter(Boolean).map(w => {
+    if (w.length > 4 && w.startsWith('وال')) return w.slice(3);
+    if (w.length > 3 && w.startsWith('ال')) return w.slice(2);
+    return w;
+  });
+}
+
+// Sound skeleton shared by Arabic and English spellings, so that
+// رسيفر = ريسيفر = receiver and ماتريكس = Matrix.
+function skeleton(w) {
+  if (/^[0-9.]+$/.test(w)) return w;
+  let x = w;
+  if (/[a-z]/.test(x)) {
+    x = x.replace(/ph/g, 'ف').replace(/sh/g, 'ش').replace(/ch/g, 'ش').replace(/th/g, 'ث').replace(/kh/g, 'خ')
+      .replace(/gh/g, 'غ').replace(/ck/g, 'ك').replace(/c(?=[eiy])/g, 'س').replace(/x/g, 'كس')
+      .replace(/[aeiouy]/g, '')
+      .replace(/b/g, 'ب').replace(/p/g, 'ب').replace(/t/g, 'ت').replace(/j/g, 'ج').replace(/g/g, 'ج')
+      .replace(/h/g, 'ه').replace(/d/g, 'د').replace(/r/g, 'ر').replace(/z/g, 'ز').replace(/s/g, 'س')
+      .replace(/f/g, 'ف').replace(/v/g, 'ف').replace(/[qkc]/g, 'ك').replace(/l/g, 'ل').replace(/m/g, 'م')
+      .replace(/n/g, 'ن').replace(/w/g, 'و');
+  }
+  x = x.replace(/[اويع]/g, '')   // long vowels (and ع, often dropped in English)
+    .replace(/[ثص]/g, 'س').replace(/[ذضظ]/g, 'ز').replace(/ط/g, 'ت').replace(/ق/g, 'ك').replace(/[ءئؤ]/g, '')
+    .replace(/(.)\1+/g, '$1');
+  return x || w;
+}
+
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  const d = Array.from({ length: m + 1 }, (_, i) => [i].concat(Array(n).fill(0)));
+  for (let j = 1; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[m][n];
+}
+
+// How alike two words are, 0..1.
+function wordScore(q, n) {
+  if (q === n) return 1;
+  const sq = skeleton(q), sn = skeleton(n);
+  if (sq === sn) return 0.95;
+  if (q.length >= 3 && (n.startsWith(q) || q.startsWith(n))) return 0.85;
+  if (sq.length >= 3 && (sn.startsWith(sq) || sq.startsWith(sn))) return 0.8;
+  const len = Math.max(sq.length, sn.length);
+  if (len < 3) return 0;
+  const sim = 1 - editDistance(sq, sn) / len;
+  return sim >= 0.66 ? sim * 0.8 : 0;
+}
+
+// How well a sheet name matches what was asked, 0..1.
+function nameScore(query, name) {
+  const qw = words(query), nw = words(name);
+  if (!qw.length || !nw.length) return 0;
+  if (qw.join(' ') === nw.join(' ')) return 1.01;
+  let total = 0;
+  qw.forEach(q => { total += Math.max(...nw.map(n => wordScore(q, n))); });
+  return total / qw.length;
 }
 
 function num(v) {
@@ -69,16 +134,15 @@ function rows(sh) {
     .map((r, i) => ({ row: i + 2, v: r }));
 }
 
-// Exact match first, then partial match in either direction.
+// Best matching rows: the clear winner alone, or the few closest ones.
 function findByName(list, col, query) {
-  const q = norm(query);
-  if (!q) return [];
-  const exact = list.filter(r => norm(r.v[col]) === q);
-  if (exact.length) return exact;
-  return list.filter(r => {
-    const n = norm(r.v[col]);
-    return n && (n.indexOf(q) >= 0 || q.indexOf(n) >= 0);
-  });
+  const scored = list
+    .map(r => ({ r: r, s: nameScore(query, r.v[col]) }))
+    .filter(x => x.s >= 0.6)
+    .sort((a, b) => b.s - a.s);
+  if (!scored.length) return [];
+  if (scored.length === 1 || scored[0].s - scored[1].s >= 0.15) return [scored[0].r];
+  return scored.filter(x => scored[0].s - x.s < 0.15).map(x => x.r);
 }
 
 function getPrice(item) {
