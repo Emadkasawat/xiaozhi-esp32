@@ -44,12 +44,15 @@ jobs:
           python -m esptool --chip esp32s3 merge_bin -o out/gemini-merged-binary.bin \
             --flash_mode keep --flash_freq keep --flash_size 16MB \
             0x0 $B/bootloader.bin 0x8000 $B/partitions.bin 0xe000 $BOOT_APP0 0x10000 $B/firmware.bin
+          # App only: flashing this at 0x10000 keeps the saved settings (Wi-Fi, key, sheet, alarms),
+          # which live in the NVS partition at 0x9000 that the full image overwrites.
+          cp $B/firmware.bin out/gemini-update-0x10000.bin
           ls -l out $B/*.bin
 
       - uses: actions/upload-artifact@v4
         with:
           name: gemini-firmware
-          path: gemini-assistant/out/gemini-merged-binary.bin
+          path: gemini-assistant/out/*.bin
 
       - name: Publish as release (direct .bin download)
         if: github.ref == 'refs/heads/gemini'
@@ -58,6 +61,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh release delete gemini-latest -y --cleanup-tag || true
-          gh release create gemini-latest gemini-assistant/out/gemini-merged-binary.bin \
+          gh release create gemini-latest gemini-assistant/out/gemini-update-0x10000.bin \
+            gemini-assistant/out/gemini-merged-binary.bin \
             --title "Gemini firmware (latest)" --target "${{ github.sha }}" --latest=false \
-            --notes "Flash gemini-merged-binary.bin at 0x0. Built from ${{ github.sha }}."
+            --notes "Update (keeps settings): flash gemini-update-0x10000.bin at 0x10000 without erase. First install / clean reset: flash gemini-merged-binary.bin at 0x0. Built from ${{ github.sha }}."
