@@ -10,6 +10,7 @@
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <esp_wifi.h>
+#include <Update.h>
 
 struct SavedNet {
   char ssid[33];
@@ -284,6 +285,7 @@ void runPortal(bool forced, const char *screenHint) {
     b += "<label class=\"inline\"><input type=\"checkbox\" name=\"clearsheet\" value=\"1\">افصل الشيت</label>";
     b += "<button class=\"btn\">حفظ الإعدادات</button></form></details>";
 
+    b += "<a class=\"btn2\" href=\"/update\">تحديث الجهاز</a>";
     if (netCount() && settings.apiKey.length())
       b += "<a class=\"btn2\" href=\"/exit\">خلصت، شغّل الجهاز</a>";
     server.send(200, "text/html; charset=utf-8", page("إعداد الجهاز", b));
@@ -411,6 +413,75 @@ void runPortal(bool forced, const char *screenHint) {
     done = true;
   });
 
+  // Firmware update from the phone: settings, networks and alarms stay saved.
+  String updError;
+  bool updOk = false;
+  uint32_t restartAt = 0;
+  server.on("/update", HTTP_GET, [&]() {
+    lastActivity = millis();
+    String b = "<a class=\"back\" href=\"/\">&rarr; رجوع</a><h1>تحديث الجهاز</h1>"
+               "<p class=\"sub\">نزّل ملف <b dir=\"ltr\">gemini-update-0x10000.bin</b> على الموبايل، واختاره هنا. "
+               "الواي فاي والمفتاح والشيت والمنبهات هيفضلوا زي ما هما.</p>"
+               "<form class=\"card form\" method=\"post\" action=\"/update\" enctype=\"multipart/form-data\" "
+               "onsubmit=\"this.querySelector('button').disabled=true;this.querySelector('button').innerText="
+               "'جاري الرفع... متقفلش الصفحة'\">"
+               "<input type=\"file\" name=\"fw\" accept=\".bin\" required style=\"height:auto;padding:12px\">"
+               "<button class=\"btn\">ابدأ التحديث</button></form>"
+               "<p class=\"small\">التحديث بياخد حوالي دقيقة. خلي الموبايل جنب الجهاز ومتقفلش الصفحة.</p>";
+    server.send(200, "text/html; charset=utf-8", page("تحديث الجهاز", b));
+  });
+  server.on(
+      "/update", HTTP_POST,
+      [&]() {
+        lastActivity = millis();
+        String b;
+        if (updOk) {
+          b = "<div class=\"done\"><svg width=\"48\" height=\"48\" viewBox=\"0 0 24 24\" fill=\"none\" "
+              "stroke=\"#fff\" stroke-width=\"2.5\" stroke-linecap=\"round\" role=\"img\" aria-label=\"تم\">"
+              "<path d=\"M5 12.5l4.5 4.5L19 7.5\"/></svg></div><h1 class=\"center\">تم التحديث</h1>"
+              "<p class=\"sub center\">الجهاز بيعيد التشغيل دلوقتي. ارجع لشبكة موبايلك العادية.</p>";
+          restartAt = millis() + 2000;
+        } else {
+          b = "<h1>التحديث ماتمش</h1><div class=\"notice bad\">" + esc(updError) +
+              "</div><p class=\"sub\">الجهاز لسه شغال بالنسخة القديمة.</p>"
+              "<a class=\"btn\" href=\"/update\">جرّب تاني</a><a class=\"btn2\" href=\"/\">الصفحة الرئيسية</a>";
+        }
+        server.send(200, "text/html; charset=utf-8", page("تحديث الجهاز", b));
+      },
+      [&]() {
+        lastActivity = millis();
+        HTTPUpload &up = server.upload();
+        if (up.status == UPLOAD_FILE_START) {
+          updOk = false;
+          updError = "";
+          if (up.filename.indexOf("merged") >= 0) {
+            updError = "ده الملف الكامل. اختار ملف gemini-update-0x10000.bin.";
+          } else if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+            updError = "مقدرش يبدأ التحديث (" + String(Update.errorString()) + ")";
+          } else {
+            setState(State::Setup, "Updating firmware...");
+            drawScreen();
+          }
+        } else if (up.status == UPLOAD_FILE_WRITE) {
+          if (updError.isEmpty() && Update.write(up.buf, up.currentSize) != up.currentSize)
+            updError = "الملف ماتكتبش (" + String(Update.errorString()) + ")";
+        } else if (up.status == UPLOAD_FILE_END) {
+          if (updError.isEmpty()) {
+            if (Update.end(true)) {
+              updOk = true;
+              setState(State::Setup, "Update done, restarting");
+            } else {
+              updError = "الملف مش سليم أو مش للجهاز ده (" + String(Update.errorString()) + ")";
+            }
+          } else if (Update.isRunning()) {
+            Update.abort();
+          }
+        } else if (up.status == UPLOAD_FILE_ABORTED) {
+          if (Update.isRunning()) Update.abort();
+          updError = "الرفع اتقطع. قرّب الموبايل من الجهاز وجرّب تاني.";
+        }
+      });
+
   // Phones probe random URLs to detect a sign-in page: send them all to the setup page.
   server.onNotFound([&]() {
     server.sendHeader("Location", String("http://") + ip.toString() + "/");
@@ -439,6 +510,7 @@ void runPortal(bool forced, const char *screenHint) {
       if (!doneAt) doneAt = millis();
       if (millis() - doneAt > 1500) break;
     }
+    if (restartAt && (int32_t)(millis() - restartAt) > 0) ESP.restart();
     if (!forced && millis() - lastActivity > 10 * 60 * 1000UL) break;
     drawScreen();
     delay(2);

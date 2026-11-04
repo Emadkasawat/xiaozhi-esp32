@@ -1596,7 +1596,7 @@ void setup() {
   xTaskCreatePinnedToCore(radioTask, "radio", 16384, nullptr, 1, nullptr, 1);
 
   // Offer the setup page for 3 seconds after power-on.
-  setState(State::Boot, "Press the button now for setup (Wi-Fi, API key)");
+  setState(State::Boot, "Press the button now for setup (Wi-Fi, key, update)");
   drawScreen();
   bool wantSetup = false;
   uint32_t t0 = millis();
