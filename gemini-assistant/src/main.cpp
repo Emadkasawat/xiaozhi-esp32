@@ -23,8 +23,9 @@
 #include <WebSocketsClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <WiFiManager.h>
 #include <Wire.h>
+#include <algorithm>
+#include <vector>
 #include <driver/i2s.h>
 #include <freertos/stream_buffer.h>
 #include <mbedtls/base64.h>
@@ -1558,59 +1559,7 @@ bool talkPressed() {
   return digitalRead(PIN_TALK) == LOW || digitalRead(PIN_BOOT) == LOW;
 }
 
-void runSetupPortal(bool forced) {
-  WiFiManager wm;
-  WiFiManagerParameter keyParam("key", "Gemini API key (leave empty to keep current)", "", 80);
-  WiFiManagerParameter modelParam("model", "Model", settings.model.c_str(), 60);
-  char volStr[8];
-  snprintf(volStr, sizeof(volStr), "%d", settings.volume);
-  WiFiManagerParameter volParam("volume", "Volume 1-100", volStr, 4);
-  WiFiManagerParameter flipParam("flip", "Flip screen (0 or 1)", settings.flip ? "1" : "0", 2);
-  WiFiManagerParameter handsParam("handsfree", "Hands-free, always listening (1) or push-to-talk (0)",
-                                  settings.handsFree ? "1" : "0", 2);
-  char thrStr[8];
-  snprintf(thrStr, sizeof(thrStr), "%d", settings.micThreshold);
-  WiFiManagerParameter thrParam("micthr", "Hands-free mic threshold (lower = more sensitive)", thrStr, 6);
-  wm.addParameter(&keyParam);
-  wm.addParameter(&modelParam);
-  wm.addParameter(&volParam);
-  wm.addParameter(&flipParam);
-  wm.addParameter(&handsParam);
-  wm.addParameter(&thrParam);
-  WiFiManagerParameter sheetUrlParam("sheeturl", "Shop sheet web app URL (leave empty to keep current)", "", 200);
-  WiFiManagerParameter sheetPwParam("sheetpw", "Shop sheet password (leave empty to keep current)", "", 40);
-  wm.addParameter(&sheetUrlParam);
-  wm.addParameter(&sheetPwParam);
-  wm.setTitle("Gemini Setup");
-  wm.setConfigPortalTimeout(forced ? 0 : 300);
-
-  setState(State::Setup, "Join Wi-Fi 'Gemini-Setup' then open 192.168.4.1");
-  drawScreen();
-  wm.startConfigPortal("Gemini-Setup");
-
-  String key = keyParam.getValue();
-  key.trim();
-  if (!key.isEmpty()) settings.apiKey = key;
-  String model = modelParam.getValue();
-  model.trim();
-  if (!model.isEmpty()) {
-    if (!model.startsWith("models/")) model = "models/" + model;
-    settings.model = model;
-  }
-  settings.volume = constrain(atoi(volParam.getValue()), 1, 100);
-  settings.flip = atoi(flipParam.getValue()) == 1;
-  settings.handsFree = atoi(handsParam.getValue()) == 1;
-  int thr = atoi(thrParam.getValue());
-  if (thr > 0) settings.micThreshold = thr;
-  String sheetUrl = sheetUrlParam.getValue();
-  sheetUrl.trim();
-  if (sheetUrl == "-") settings.sheetUrl = "";  // "-" removes the sheet
-  else if (sheetUrl.startsWith("https://")) settings.sheetUrl = sheetUrl;
-  String sheetPw = sheetPwParam.getValue();
-  sheetPw.trim();
-  if (!sheetPw.isEmpty()) settings.sheetPassword = sheetPw;
-  saveSettings();
-}
+#include "portal.h"
 
 void setup() {
   Serial.begin(115200);
@@ -1646,19 +1595,13 @@ void setup() {
   while (talkPressed()) delay(20);
 
   WiFi.mode(WIFI_STA);
-  if (wantSetup || settings.apiKey.isEmpty()) {
-    runSetupPortal(settings.apiKey.isEmpty());
-  }
+  loadNets();
+  bool firstRun = settings.apiKey.isEmpty() || netCount() == 0;
+  if (wantSetup || firstRun) runPortal(firstRun, "Join Wi-Fi 'Gemini-Setup' then open 192.168.4.1");
 
-  setState(State::Wifi, "Connecting to saved Wi-Fi");
-  drawScreen();
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(300);
-  wm.setEnableConfigPortal(false);
-  if (!wm.autoConnect("Gemini-Setup")) {
-    // No saved network or it failed: open the full setup page.
-    runSetupPortal(true);
-  }
+  // Join the strongest saved network; if none is around, open the setup page and try again.
+  while (WiFi.status() != WL_CONNECTED && !connectKnown())
+    runPortal(false, "No saved Wi-Fi here. Join 'Gemini-Setup' on your phone");
   WiFi.setSleep(false);  // lower latency for streaming audio
   configTzTime(EGYPT_TZ, "pool.ntp.org", "time.google.com");
 
