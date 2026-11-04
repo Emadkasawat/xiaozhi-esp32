@@ -61,7 +61,8 @@ static const char *SYSTEM_PROMPT =
     "أنت مساعد صوتي ودود اسمه جيميناي، شغال جوه جهاز صغير. "
     "رد دايمًا بالعربي المصري، بجمل قصيرة وواضحة تتقال بصوت عالي، "
     "من غير رموز أو قوائم أو تنسيق. لو المستخدم كلمك بلغة تانية رد بنفس لغته. "
-    "لو السؤال محتاج معلومة حديثة استخدم البحث. "
+    "استخدم بحث جوجل بس لو المستخدم طلب حاجة من النت زي الأخبار أو الماتشات أو الطقس أو معلومة مش عندك؛ "
+    "متدورش في النت لأسعار المحل أو الآجل أو المنبهات أو الساعة، دي ليها أدواتها. "
     "لو طلب راديو أو محطة استخدم play_radio، وقول جملة قصيرة جدًا قبل التشغيل. "
     "وقف الراديو بـ stop_radio، وغيّر الصوت بـ set_volume. "
     "لو طلب منبه أو تذكير استخدم set_reminder، واكتب نص التذكير بنفس كلام المستخدم من غير تغيير. "
@@ -918,6 +919,12 @@ bool sessionReady = false;
 bool waitingForReply = false;
 bool turnDone = true;
 String closeReason;
+// Cost control: Gemini bills the whole conversation again on every turn, so a
+// quiet device starts a fresh, empty session instead of carrying old talk.
+static const uint32_t FRESH_SESSION_IDLE_MS = 2 * 60 * 1000UL;
+uint32_t lastTurnMs = 0;   // last time anything was said or played
+int sessionTurns = 0;      // answers in the current session
+bool refreshing = false;   // we closed the session on purpose
 
 uint8_t *decodeBuf = nullptr;
 size_t decodeBufSize = 0;
@@ -1008,6 +1015,8 @@ void sendSetup() {
            "\"required\":[\"customer\"]}}";
   }
   msg += "]}]";
+  // Old talk is trimmed once the context grows, so each turn stays cheap.
+  msg += ",\"contextWindowCompression\":{\"triggerTokens\":12000,\"slidingWindow\":{\"targetTokens\":6000}}";
   if (!settings.handsFree) {
     // Push-to-talk: we mark the start and end of speech ourselves.
     msg += ",\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}}";
@@ -1227,6 +1236,8 @@ void handleServerMessage(char *msg, size_t len) {
   if (strstr(msg, "\"setupComplete\"")) {
     sessionReady = true;
     closeReason = "";
+    sessionTurns = 0;
+    refreshing = false;
     setState(State::Ready);
   }
 
@@ -1263,6 +1274,8 @@ void handleServerMessage(char *msg, size_t len) {
   }
   if (strstr(msg, "\"turnComplete\"")) {
     turnDone = true;
+    sessionTurns++;
+    lastTurnMs = millis();
   }
   if (strstr(msg, "\"error\"")) {
     Serial.printf("[gemini] %.300s\n", msg);
@@ -1292,7 +1305,9 @@ void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_DISCONNECTED:
       Serial.println("[ws] disconnected");
       sessionReady = false;
-      if (!closeReason.isEmpty()) {
+      if (refreshing) {
+        setState(State::Connecting, "Fresh session");
+      } else if (!closeReason.isEmpty()) {
         setState(State::Error, closeReason);
       } else if (state != State::Error) {
         setState(State::Connecting, "Reconnecting");
@@ -1643,6 +1658,16 @@ void loop() {
   }
 
   if (!playbackIdle() || radioActive) lastPlaybackMs = millis();
+  if (recording || gateOpen || !turnDone || !playbackIdle() || radioActive || radioPending ||
+      pendingReminder.length())
+    lastTurnMs = millis();
+  if (sessionReady && sessionTurns > 0 && millis() - lastTurnMs > FRESH_SESSION_IDLE_MS) {
+    Serial.println("[gemini] idle: starting a fresh session to keep the cost down");
+    refreshing = true;
+    sessionReady = false;
+    closeReason = "";
+    ws.disconnect();  // the library reconnects by itself and sends a new setup
+  }
 
   // Start the radio once Gemini has finished announcing it.
   if (radioPending && ((turnDone && playbackIdle()) || millis() - radioPendingMs > 10000)) {
