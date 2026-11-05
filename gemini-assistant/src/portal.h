@@ -427,7 +427,9 @@ void runPortal(bool forced, const char *screenHint) {
                "'جاري الرفع... متقفلش الصفحة'\">"
                "<input type=\"file\" name=\"fw\" accept=\".bin\" required style=\"height:auto;padding:12px\">"
                "<button class=\"btn\">ابدأ التحديث</button></form>"
-               "<p class=\"small\">التحديث بياخد حوالي دقيقة. خلي الموبايل جنب الجهاز ومتقفلش الصفحة.</p>";
+               "<p class=\"small\">التحديث بياخد حوالي دقيقة. خلي الموبايل جنب الجهاز ومتقفلش الصفحة.</p>"
+               "<div class=\"notice\">لو زرار اختيار الملف مش بيفتح، يبقى الصفحة فاتحة في الشباك الصغير اللي بيفتح لوحده. "
+               "سيبه مفتوح، وافتح Safari أو Chrome واكتب <b dir=\"ltr\">http://192.168.4.1/update</b></div>";
     server.send(200, "text/html; charset=utf-8", page("تحديث الجهاز", b));
   });
   server.on(
