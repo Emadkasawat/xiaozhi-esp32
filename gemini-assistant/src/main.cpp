@@ -58,9 +58,11 @@ static const char *GEMINI_PATH =
 static const char *DEFAULT_MODEL = "models/gemini-3.8-live";
 
 static const char *SYSTEM_PROMPT =
+    "RESPOND IN ARABIC (EGYPTIAN DIALECT). YOU MUST RESPOND UNMISTAKABLY IN EGYPTIAN ARABIC, ALWAYS, "
+    "even if the user speaks English, even if you hear another language or unclear noise. Never switch language. "
     "أنت مساعد صوتي ودود اسمه جيميناي، شغال جوه جهاز صغير. "
-    "رد دايمًا بالعربي المصري، بجمل قصيرة وواضحة تتقال بصوت عالي، "
-    "من غير رموز أو قوائم أو تنسيق. لو المستخدم كلمك بلغة تانية رد بنفس لغته. "
+    "لازم ترد دايمًا بالعربي المصري وبس، حتى لو سمعت كلام بلغة تانية أو صوت مش واضح، ومتغيرش اللغة أبدًا. "
+    "رد بجمل قصيرة وواضحة تتقال بصوت عالي، من غير رموز أو قوائم أو تنسيق. "
     "استخدم بحث جوجل بس لو المستخدم طلب حاجة من النت زي الأخبار أو الماتشات أو الطقس أو معلومة مش عندك؛ "
     "متدورش في النت لأسعار المحل أو الآجل أو المنبهات أو الساعة، دي ليها أدواتها. "
     "لو طلب راديو أو محطة استخدم play_radio، وقول جملة قصيرة جدًا قبل التشغيل. "
@@ -1490,8 +1492,9 @@ void stopTalking() {
 // A short two-note "message arrived" chime, played twice.
 void queueChime() {
   static const int RATE = SPK_RATE;
-  const int noteMs = 110, gapMs = 50;
-  const float notes[] = {1046.5f, 1568.0f, 0, 1046.5f, 1568.0f};
+  // Three clear beeps before a reminder is spoken.
+  const int noteMs = 180, gapMs = 170;
+  const float notes[] = {1760.0f, 1760.0f, 1760.0f, 0};
   size_t total = 0;
   for (float f : notes) total += (f > 0 ? noteMs : 250) + gapMs;
   size_t samples = total * RATE / 1000;
@@ -1501,7 +1504,8 @@ void queueChime() {
   for (float f : notes) {
     int len = (f > 0 ? noteMs : 250) * RATE / 1000;
     for (int i = 0; i < len; i++) {
-      float env = f > 0 ? expf(-4.0f * i / len) : 0;
+      // Flat beep with short fade in/out so it does not click.
+      float env = f > 0 ? fminf(1.0f, fminf(i, len - i) / (0.01f * RATE)) : 0;
       pcm[pos++] = (int16_t)(env * 14000.0f * sinf(2.0f * PI * f * i / RATE));
     }
     int gap = gapMs * RATE / 1000;
