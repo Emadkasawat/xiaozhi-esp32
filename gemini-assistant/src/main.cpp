@@ -70,6 +70,10 @@ static const char *SYSTEM_PROMPT =
     "لو طلب منبه أو تذكير استخدم set_reminder، واكتب نص التذكير بنفس كلام المستخدم من غير تغيير. "
     "لو طلب تأجيل التذكير اللي لسه رن استخدم snooze_reminder. "
     "لو قال إن زبون هيدفع في يوم معين استخدم shop_payment_due. "
+    "لو طلب عداد أو تايمر أو قال نبهني بعد كام دقيقة من غير رسالة معينة استخدم start_timer. "
+    "لو قال إن صنف خلص أو ناقص أو قرب يخلص استخدم need_add. لو سأل عن النواقص أو هيطلب إيه استخدم need_list. "
+    "لو قال إنه جاب صنف من النواقص أو طلب البضاعة استخدم need_remove. "
+    "لو قال عن التذكير اللي رن إنه خلص أو تمام أو عرفت استخدم reminder_done. "
     "لو سأل الساعة كام أو التاريخ استخدم get_time.";
 
 // ---------------------------------------------------------------- settings
@@ -165,6 +169,11 @@ void drawWrapped(const String &text, int y, int width, int lineHeight, int maxLi
 }
 
 String radioNote;  // last radio problem, kept on the Ready screen
+// Filled in further down (reminders section); used by the Ready screen.
+extern bool ackActive;
+bool timerActive();
+uint32_t timerSecondsLeft();
+String nextReminderLine();
 
 void drawScreen() {
   if (!screenDirty) return;
@@ -187,7 +196,40 @@ void drawScreen() {
       default: break;
     }
   }
-  drawWrapped(d, 32, 21, 11, 4);
+  if (state == State::Ready) {
+    // Clock at the top right, next reminder at the bottom, countdown in the middle.
+    time_t now = time(nullptr);
+    if (now > 1700000000) {
+      struct tm t;
+      localtime_r(&now, &t);
+      char clk[8];
+      snprintf(clk, sizeof(clk), "%02d:%02d", t.tm_hour, t.tm_min);
+      oled.drawStr(128 - 30, 10, clk);
+    }
+    String next = nextReminderLine();
+    int nextY = settings.handsFree ? 43 : 58;
+    if (timerActive()) {
+      unsigned left = timerSecondsLeft();
+      char buf[16];
+      if (left >= 3600) snprintf(buf, sizeof(buf), "%u:%02u:%02u", left / 3600, left / 60 % 60, left % 60);
+      else snprintf(buf, sizeof(buf), "%02u:%02u", left / 60, left % 60);
+      if (settings.handsFree) {
+        oled.drawStr(0, 32, (String("Timer ") + buf).c_str());
+      } else {
+        oled.drawStr(0, 32, "Timer");
+        oled.setFont(u8g2_font_helvB14_tr);
+        oled.drawStr(40, 42, buf);
+        oled.setFont(u8g2_font_6x10_tr);
+      }
+    } else if (ackActive && detail.isEmpty()) {
+      drawWrapped("1 press: +10 min    2 presses: done", 32, 21, 11, settings.handsFree ? 1 : 2);
+    } else {
+      drawWrapped(d, 32, 21, 11, next.length() ? (settings.handsFree ? 1 : 2) : 4);
+    }
+    if (next.length()) oled.drawStr(0, nextY, next.c_str());
+  } else {
+    drawWrapped(d, 32, 21, 11, 4);
+  }
   oled.sendBuffer();
 }
 
@@ -711,6 +753,71 @@ String lastFiredText;     // for snooze
 uint8_t lastFiredKind = KIND_NOTE;
 uint32_t lastFiredMs = 0;
 
+// After a reminder is spoken it keeps ringing every few minutes until the
+// user confirms (two short presses or by voice) or snoozes it (one press).
+static const uint32_t RERING_MS = 5 * 60 * 1000UL;
+static const uint32_t SNOOZE_MS = 10 * 60 * 1000UL;
+static const int MAX_RERINGS = 6;
+bool ackActive = false;
+String ackText;
+uint8_t ackKind = KIND_NOTE;
+uint32_t ackNextMs = 0;
+int ackRings = 0;
+
+// Countdown timer (kept in RAM: a power cut cancels it).
+uint32_t timerEndMs = 0;
+bool timerOn = false;
+String timerLabel;
+bool timerActive() { return timerOn; }
+uint32_t timerSecondsLeft() {
+  int32_t left = (int32_t)(timerEndMs - millis());
+  return left > 0 ? (left + 999) / 1000 : 0;
+}
+
+// Shopping "we ran out of" list, one item per line.
+String needs;
+void loadNeeds() {
+  prefs.begin("gemini", true);
+  needs = prefs.getString("needs", "");
+  prefs.end();
+}
+void saveNeeds() {
+  prefs.begin("gemini", false);
+  prefs.putString("needs", needs);
+  prefs.end();
+}
+int needCount() {
+  int n = 0;
+  for (size_t i = 0; i < needs.length(); i++)
+    if (needs[i] == '\n') n++;
+  return n;
+}
+String listNeeds() {
+  if (needs.isEmpty()) return "the list is empty";
+  String out;
+  int n = 1, start = 0;
+  while (start < (int)needs.length()) {
+    int end = needs.indexOf('\n', start);
+    if (end < 0) end = needs.length();
+    out += String(n++) + ") " + needs.substring(start, end) + ". ";
+    start = end + 1;
+  }
+  return out;
+}
+bool removeNeed(int number) {
+  int n = 1, start = 0;
+  while (start < (int)needs.length()) {
+    int end = needs.indexOf('\n', start);
+    if (end < 0) end = needs.length();
+    if (n++ == number) {
+      needs.remove(start, end - start + 1);
+      return true;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
 void saveReminders() {
   prefs.begin("gemini", false);
   prefs.putBytes("rem2", reminders, sizeof(reminders));
@@ -851,6 +958,35 @@ String listReminders() {
   return n ? out : "no reminders";
 }
 
+// "Next 17:30, 3 today" for the Ready screen ("" when there is nothing).
+String nextReminderLine() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return "";
+  time_t best = 0;
+  struct tm tn;
+  localtime_r(&now, &tn);
+  int today = 0;
+  for (int i = 0; i < MAX_REMINDERS; i++) {
+    const Reminder &r = reminders[i];
+    if (!r.used) continue;
+    if (!best || (time_t)r.at < best) best = r.at;
+    time_t at = r.at;
+    struct tm tr;
+    localtime_r(&at, &tr);
+    if (tr.tm_yday == tn.tm_yday && tr.tm_year == tn.tm_year) today++;
+  }
+  if (!best) return "";
+  struct tm tb;
+  localtime_r(&best, &tb);
+  char buf[32];
+  if (tb.tm_yday == tn.tm_yday && tb.tm_year == tn.tm_year) {
+    snprintf(buf, sizeof(buf), "Next %02d:%02d, %d today", tb.tm_hour, tb.tm_min, today);
+  } else {
+    strftime(buf, sizeof(buf), "Next %a %d/%m %H:%M", &tb);
+  }
+  return buf;
+}
+
 int freeReminderSlot() {
   for (int i = 0; i < MAX_REMINDERS; i++)
     if (!reminders[i].used) return i;
@@ -983,6 +1119,23 @@ void sendSetup() {
          "\"required\":[\"minutes\"]}},"
          "{\"name\":\"list_reminders\",\"description\":\"List the alarms/reminders with their numbers.\"},"
          "{\"name\":\"cancel_reminder\",\"description\":\"Cancel a reminder by its number from list_reminders, or 0 for all.\","
+         "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"number\":{\"type\":\"INTEGER\"}},"
+         "\"required\":[\"number\"]}},"
+         "{\"name\":\"reminder_done\",\"description\":\"The user confirms the reminder that just rang is handled; "
+         "stops it from ringing again.\"},"
+         "{\"name\":\"start_timer\",\"description\":\"Start a countdown timer shown on the screen. Beeps and "
+         "announces when it ends. Only one timer at a time; a new one replaces the old.\","
+         "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"minutes\":{\"type\":\"INTEGER\"},"
+         "\"seconds\":{\"type\":\"INTEGER\"},"
+         "\"label\":{\"type\":\"STRING\",\"description\":\"Optional, what the timer is for, user's words\"}}}},"
+         "{\"name\":\"cancel_timer\",\"description\":\"Cancel the countdown timer.\"},"
+         "{\"name\":\"need_add\",\"description\":\"Add items the shop ran out of (or is low on) to the "
+         "restock list.\",\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"items\":{\"type\":\"STRING\","
+         "\"description\":\"One or more items separated by commas, in the user's Arabic words\"}},"
+         "\"required\":[\"items\"]}},"
+         "{\"name\":\"need_list\",\"description\":\"Read the restock list with item numbers.\"},"
+         "{\"name\":\"need_remove\",\"description\":\"Remove an item from the restock list by its number from "
+         "need_list, or 0 to clear the whole list.\","
          "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{\"number\":{\"type\":\"INTEGER\"}},"
          "\"required\":[\"number\"]}},"
          "{\"name\":\"set_volume\",\"description\":\"Set the speaker volume.\","
@@ -1196,7 +1349,61 @@ void handleToolCall(const char *msg) {
         strlcpy(r.text, lastFiredText.c_str(), sizeof(r.text));
         reminders[slot] = r;
         saveReminders();
+        ackActive = false;
+        screenDirty = true;
         sendToolResponse(id, name, "snoozed " + String(minutes) + " minutes, will ring at " + fmtTime(r.at));
+      }
+    } else if (name == "reminder_done") {
+      ackActive = false;
+      screenDirty = true;
+      sendToolResponse(id, name, "ok, it will not ring again");
+    } else if (name == "start_timer") {
+      long secs = (long)jsonInt(call, "minutes", 0) * 60 + jsonInt(call, "seconds", 0);
+      if (secs <= 0 || secs > 24L * 3600) {
+        sendToolResponse(id, name, "need minutes or seconds (up to 24 hours)");
+      } else {
+        timerEndMs = millis() + secs * 1000UL;
+        timerLabel = jsonField(call, "label");
+        timerOn = true;
+        screenDirty = true;
+        sendToolResponse(id, name, "timer started for " + String(secs / 60) + " min " + String(secs % 60) + " s");
+      }
+    } else if (name == "cancel_timer") {
+      bool was = timerOn;
+      timerOn = false;
+      screenDirty = true;
+      sendToolResponse(id, name, was ? "timer cancelled" : "no timer running");
+    } else if (name == "need_add") {
+      String items = jsonField(call, "items");
+      items.replace("،", ",");
+      int added = 0, start = 0;
+      while (start <= (int)items.length()) {
+        int end = items.indexOf(',', start);
+        if (end < 0) end = items.length();
+        String it = items.substring(start, end);
+        it.trim();
+        it.replace("\n", " ");
+        if (it.length() && needs.length() + it.length() < 1800 && ("\n" + needs).indexOf("\n" + it + "\n") < 0) {
+          needs += it + "\n";
+          added++;
+        }
+        start = end + 1;
+      }
+      saveNeeds();
+      sendToolResponse(id, name, "added " + String(added) + ", the list now has " + String(needCount()) + " items");
+    } else if (name == "need_list") {
+      sendToolResponse(id, name, listNeeds());
+    } else if (name == "need_remove") {
+      int n = jsonRaw(call, "number").toInt();
+      if (n == 0) {
+        needs = "";
+        saveNeeds();
+        sendToolResponse(id, name, "list cleared");
+      } else if (removeNeed(n)) {
+        saveNeeds();
+        sendToolResponse(id, name, "removed, " + String(needCount()) + " items left");
+      } else {
+        sendToolResponse(id, name, "no item with that number");
       }
     } else if (name == "list_reminders") {
       sendToolResponse(id, name, listReminders());
@@ -1489,30 +1696,44 @@ void stopTalking() {
 }
 
 // ---------------------------------------------------------------- reminder ringing
-// A short two-note "message arrived" chime, played twice.
-void queueChime() {
+// Queues `count` beeps of the given pitch on the speaker.
+void queueBeeps(int count, float freq, int noteMs = 180, int gapMs = 170) {
   static const int RATE = SPK_RATE;
-  // Three clear beeps before a reminder is spoken.
-  const int noteMs = 180, gapMs = 170;
-  const float notes[] = {1760.0f, 1760.0f, 1760.0f, 0};
-  size_t total = 0;
-  for (float f : notes) total += (f > 0 ? noteMs : 250) + gapMs;
-  size_t samples = total * RATE / 1000;
-  int16_t *pcm = (int16_t *)ps_malloc(samples * 2);
+  int note = noteMs * RATE / 1000, gap = gapMs * RATE / 1000;
+  size_t samples = (size_t)count * (note + gap) + RATE / 4;
+  int16_t *pcm = (int16_t *)ps_calloc(samples, 2);
   if (!pcm) return;
   size_t pos = 0;
-  for (float f : notes) {
-    int len = (f > 0 ? noteMs : 250) * RATE / 1000;
-    for (int i = 0; i < len; i++) {
-      // Flat beep with short fade in/out so it does not click.
-      float env = f > 0 ? fminf(1.0f, fminf(i, len - i) / (0.01f * RATE)) : 0;
-      pcm[pos++] = (int16_t)(env * 14000.0f * sinf(2.0f * PI * f * i / RATE));
+  for (int n = 0; n < count; n++) {
+    for (int i = 0; i < note; i++) {
+      // Flat beep with a short fade in/out so it does not click.
+      float env = fminf(1.0f, fminf(i, note - i) / (0.01f * RATE));
+      pcm[pos++] = (int16_t)(env * 14000.0f * sinf(2.0f * PI * freq * i / RATE));
     }
-    int gap = gapMs * RATE / 1000;
-    for (int i = 0; i < gap; i++) pcm[pos++] = 0;
+    pos += gap;
   }
-  queuePlayback((const uint8_t *)pcm, pos * 2);
+  queuePlayback((const uint8_t *)pcm, samples * 2);
   free(pcm);
+}
+
+// Three clear beeps before a reminder is spoken.
+void queueChime() { queueBeeps(3, 1760.0f); }
+
+// One short press after a reminder: ring again in 10 minutes.
+void ackSnooze() {
+  if (!ackActive) return;
+  ackNextMs = millis() + SNOOZE_MS;
+  ackRings = 0;
+  queueBeeps(1, 880.0f);
+  setState(State::Ready, "Snoozed 10 minutes");
+}
+
+// Two short presses after a reminder: handled, stop ringing.
+void ackDone() {
+  if (!ackActive) return;
+  ackActive = false;
+  queueBeeps(2, 1320.0f, 110, 90);
+  setState(State::Ready, "Reminder done");
 }
 
 void sendClientText(const String &text) {
@@ -1521,17 +1742,39 @@ void sendClientText(const String &text) {
   ws.sendTXT(msg);
 }
 
+bool pendingIsRering = false;
+
 void checkReminders() {
   static uint32_t lastCheck = 0;
-  if (millis() - lastCheck < 1000 || !clockOk()) return;
+  if (millis() - lastCheck < 1000) return;
   lastCheck = millis();
-  if (pendingReminder.isEmpty()) {
+  // The countdown timer and re-rings run on the device's own clock.
+  if (timerOn && state == State::Ready) screenDirty = true;  // tick the countdown
+  if (timerOn && (int32_t)(timerEndMs - millis()) <= 0 && pendingReminder.isEmpty()) {
+    timerOn = false;
+    screenDirty = true;
+    pendingReminder = timerLabel.length() ? "انتهى وقت العداد: " + timerLabel : String("انتهى وقت العداد");
+    pendingKind = KIND_NOTE;
+    pendingIsRering = false;
+  }
+  if (ackActive && (int32_t)(millis() - ackNextMs) >= 0 && pendingReminder.isEmpty()) {
+    if (ackRings >= MAX_RERINGS) {
+      ackActive = false;  // give up after half an hour without an answer
+      screenDirty = true;
+    } else {
+      pendingReminder = ackText;
+      pendingKind = ackKind;
+      pendingIsRering = true;
+    }
+  }
+  if (pendingReminder.isEmpty() && clockOk()) {
     time_t now = time(nullptr);
     for (int i = 0; i < MAX_REMINDERS; i++) {
       Reminder &r = reminders[i];
       if (!r.used || r.at > now) continue;
       pendingReminder = r.text;
       pendingKind = r.kind;
+      pendingIsRering = false;
       if (now - r.at > 120) pendingReminder += " (this reminder was missed while the device was off)";
       time_t next = r.repeat != REPEAT_NONE ? nextOccurrence(r) : 0;
       if (next) {
@@ -1553,6 +1796,13 @@ void checkReminders() {
     lastFiredText = pendingReminder;
     lastFiredKind = pendingKind;
     lastFiredMs = millis();
+    // Keep ringing every 5 minutes until the user answers.
+    if (!pendingIsRering) ackRings = 0;
+    ackRings++;
+    ackActive = true;
+    ackText = pendingReminder;
+    ackKind = pendingKind;
+    ackNextMs = millis() + RERING_MS;
     if (pendingKind == KIND_PAYMENT) {
       setState(State::Speaking, "Payment due");
       drawScreen();
@@ -1567,7 +1817,7 @@ void checkReminders() {
       sendClientText(
           "[Reminder from the device alarm] Say to the user, in Egyptian Arabic, the word تذكير then exactly this "
           "reminder in the same words, nothing else: " +
-          pendingReminder);
+          pendingReminder + (pendingIsRering ? " (repeat: the user has not confirmed it yet)" : ""));
     }
     pendingReminder = "";
   }
@@ -1587,6 +1837,7 @@ void setup() {
 
   loadSettings();
   loadReminders();
+  loadNeeds();
 
   Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
   oled.setBusClock(400000);
@@ -1633,6 +1884,10 @@ void setup() {
   if (settings.handsFree) i2s_start(I2S_MIC);
 }
 
+uint32_t ackPressMs = 0, ackClickMs = 0;
+int ackClicks = 0;
+bool ackHeld = false;
+
 void loop() {
   if (settings.apiKey.isEmpty()) {
     delay(100);
@@ -1652,6 +1907,21 @@ void loop() {
     } else if (pressed && state == State::Error) {
       closeReason = "";
       setState(State::Connecting, "Retrying");
+    } else if (ackActive && !recording) {
+      // A reminder is waiting for an answer: short presses answer it,
+      // holding the button still talks (handled below).
+      if (pressed) {
+        ackPressMs = millis();
+        ackHeld = true;
+      } else if (ackHeld) {
+        ackHeld = false;
+        if (++ackClicks >= 2) {
+          ackClicks = 0;
+          ackDone();
+        } else {
+          ackClickMs = millis();
+        }
+      }
     } else if (settings.handsFree) {
       if (pressed && state == State::Speaking) flushPlayback = true;  // stop talking
     } else if (pressed && sessionReady) {
@@ -1660,6 +1930,16 @@ void loop() {
       stopTalking();
     }
   }
+  if (ackHeld && !settings.handsFree && sessionReady && millis() - ackPressMs > 400) {
+    ackHeld = false;  // a long press: the user wants to talk
+    ackClicks = 0;
+    startTalking();
+  }
+  if (ackClicks == 1 && !ackHeld && millis() - ackClickMs > 500) {
+    ackClicks = 0;
+    ackSnooze();
+  }
+  if (!ackActive) ackClicks = 0, ackHeld = false;
 
   if (!playbackIdle() || radioActive) lastPlaybackMs = millis();
   if (recording || gateOpen || !turnDone || !playbackIdle() || radioActive || radioPending ||
@@ -1685,6 +1965,11 @@ void loop() {
     setState(State::Radio, radioName);
   }
   checkReminders();
+  static uint32_t lastClockDraw = 0;
+  if (state == State::Ready && millis() - lastClockDraw > 20000) {
+    lastClockDraw = millis();
+    screenDirty = true;
+  }
 
   // While the radio plays, show what is happening; give up if no sound comes.
   static uint32_t lastRadioDraw = 0;
